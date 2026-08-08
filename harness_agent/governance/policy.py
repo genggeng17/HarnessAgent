@@ -32,8 +32,25 @@ class PolicyDecision(BaseModel):
 class PolicyEngine:
     """只判断 Registry 元数据；不执行工具或修改 TurnState。"""
 
-    def __init__(self, mode: PermissionMode = PermissionMode.SAFE_EDIT) -> None:
+    _DANGEROUS_GIT = {
+        ("git", "reset", "--hard"),
+        ("git", "checkout", "--"),
+        ("git", "restore"),
+    }
+
+    def __init__(
+        self,
+        mode: PermissionMode = PermissionMode.SAFE_EDIT,
+        *,
+        read_only_command_allowlist: tuple[str, ...] = (
+            "git status",
+            "git diff",
+            "git log",
+            "git show",
+        ),
+    ) -> None:
         self.mode = mode
+        self.read_only_command_allowlist = frozenset(read_only_command_allowlist)
 
     def evaluate(
         self,
@@ -45,14 +62,55 @@ class PolicyEngine:
 
         if tool.side_effect == SideEffect.NONE and tool.kind == ToolKind.READ:
             return PolicyDecision(outcome=PolicyOutcome.ALLOW, reason="工作区内只读工具")
+        if tool.kind == ToolKind.VERIFICATION:
+            if self.mode == PermissionMode.READ_ONLY:
+                return PolicyDecision(outcome=PolicyOutcome.ASK, reason="只读模式运行验证需要审批")
+            return PolicyDecision(outcome=PolicyOutcome.ALLOW, reason="已注册验证器")
+        if tool.kind == ToolKind.SHELL:
+            return self._evaluate_shell(arguments)
         if workspace.read_only or self.mode == PermissionMode.READ_ONLY:
-            return PolicyDecision(outcome=PolicyOutcome.DENY, reason="只读模式禁止副作用")
+            return PolicyDecision(outcome=PolicyOutcome.DENY, reason="只读模式禁止修改工作区")
         if tool.kind == ToolKind.WRITE and tool.name == "apply_patch":
             patch = str(arguments.get("patch", ""))
             if "+++ /dev/null" in patch:
                 return PolicyDecision(outcome=PolicyOutcome.ASK, reason="删除文件需要审批")
-        if tool.kind in {ToolKind.WRITE, ToolKind.VERIFICATION}:
-            return PolicyDecision(outcome=PolicyOutcome.ALLOW, reason="安全编辑模式允许受控写入和已注册验证")
-        if tool.kind == ToolKind.SHELL:
-            return PolicyDecision(outcome=PolicyOutcome.ASK, reason="一般 Shell 需要审批；审批恢复属于 M4")
+        if tool.kind == ToolKind.WRITE:
+            return PolicyDecision(outcome=PolicyOutcome.ALLOW, reason="允许受控工作区修改")
         return PolicyDecision(outcome=PolicyOutcome.DENY, reason="未知工具类别")
+
+    def _evaluate_shell(self, arguments: dict[str, object]) -> PolicyDecision:
+        argv = arguments.get("argv")
+        if not isinstance(argv, (list, tuple)) or not all(isinstance(item, str) for item in argv):
+            outcome = PolicyOutcome.DENY if self.mode == PermissionMode.READ_ONLY else PolicyOutcome.ASK
+            return PolicyDecision(outcome=outcome, reason="Shell 参数将在执行前进行校验")
+        values = tuple(argv)
+        if self._is_dangerous_command(values):
+            return PolicyDecision(outcome=PolicyOutcome.DENY, reason="命令会丢弃修改或破坏系统")
+        if self._is_readonly_git(values):
+            return PolicyDecision(outcome=PolicyOutcome.ALLOW, reason="已允许的只读 Git 命令")
+        if self.mode == PermissionMode.READ_ONLY:
+            return PolicyDecision(outcome=PolicyOutcome.DENY, reason="只读模式仅允许已登记的只读命令")
+        return PolicyDecision(outcome=PolicyOutcome.ASK, reason="该 Shell 命令需要用户审批")
+
+    def _is_readonly_git(self, argv: tuple[str, ...]) -> bool:
+        if len(argv) < 2 or argv[0] != "git":
+            return False
+        command = " ".join(argv[:2])
+        if command not in self.read_only_command_allowlist:
+            return False
+        unsafe_markers = {"-c", "--config-env", "--exec-path", "--no-pager", ">", "<", "|", "&&", ";"}
+        return not any(item in unsafe_markers or item.startswith("-") and item != "--stat" for item in argv[2:])
+
+    @classmethod
+    def _is_dangerous_command(cls, argv: tuple[str, ...]) -> bool:
+        if len(argv) >= 3 and argv[:3] in cls._DANGEROUS_GIT:
+            return True
+        if len(argv) >= 2 and argv[:2] == ("git", "restore"):
+            return True
+        if len(argv) >= 2 and argv[:2] == ("git", "clean") and any(
+            "f" in item and "d" in item for item in argv[2:]
+        ):
+            return True
+        joined = " ".join(argv).lower()
+        markers = ("rm -rf /", "rm -rf .", "rmdir /s", "del /s", "format ", "shutdown ", "reboot", "fork bomb")
+        return any(marker in joined for marker in markers)

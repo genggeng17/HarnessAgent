@@ -10,6 +10,24 @@ from harness_agent.agent.state_machine import (
     StateTransitionError,
     TransitionErrorCode,
 )
+from harness_agent.agent.verification import VerificationResult
+
+
+def verification(
+    validator_id: str, *, revision: int = 1, passed: bool = True
+) -> VerificationResult:
+    return VerificationResult(
+        verification_id=f"verification-{validator_id}-{passed}",
+        validator_id=validator_id,
+        workspace_revision=revision,
+        tool_call_id=f"call-{validator_id}",
+        passed=passed,
+        exit_code=0 if passed else 1,
+        timed_out=False,
+        output_summary="",
+        tool_result_ref=f"tool_result:call-{validator_id}",
+        command_log_ref=None,
+    )
 
 
 class StateMachineTests(unittest.TestCase):
@@ -20,6 +38,16 @@ class StateMachineTests(unittest.TestCase):
 
     def parse(self, body: str):  # type: ignore[no-untyped-def]
         return self.parser.parse(body)
+
+    def dirty_executing_state(self) -> TurnState:
+        state = self.machine.record_write_succeeded(self.state)
+        return self.machine.apply_action(
+            state,
+            self.parse(
+                '{"schema_version":1,"type":"plan","items":['
+                '{"id":"verify","description":"运行验证"}]}'
+            ),
+        )
 
     def test_simple_final_completes_without_plan(self) -> None:
         final = self.parse(
@@ -99,12 +127,66 @@ class StateMachineTests(unittest.TestCase):
         )
         state = self.machine.record_verification_started(state)
         state = self.machine.record_verification_finished(
-            state, all_required_passed=True
+            state,
+            verification=verification("tests"),
+            required_validator_ids=frozenset({"tests"}),
         )
 
         self.assertFalse(state.workspace_dirty)
         self.assertEqual(state.workspace_revision, 1)
         self.assertEqual(state.phase, TurnPhase.EXECUTING)
+        self.assertEqual(state.verification_history[0].validator_id, "tests")
+
+    def test_empty_required_validators_never_clear_dirty_workspace(self) -> None:
+        state = self.dirty_executing_state()
+        state = self.machine.record_verification_started(state)
+
+        state = self.machine.record_verification_finished(
+            state,
+            verification=verification("missing"),
+            required_validator_ids=frozenset(),
+        )
+
+        self.assertTrue(state.workspace_dirty)
+
+    def test_multiple_validator_progress_survives_state_reload(self) -> None:
+        state = self.dirty_executing_state()
+        state = self.machine.record_verification_started(state)
+        state = self.machine.record_verification_finished(
+            state,
+            verification=verification("unit"),
+            required_validator_ids=frozenset({"unit", "integration"}),
+        )
+        reloaded = TurnState.model_validate_json(state.model_dump_json())
+        self.assertTrue(reloaded.workspace_dirty)
+
+        reloaded = self.machine.record_verification_started(reloaded)
+        reloaded = self.machine.record_verification_finished(
+            reloaded,
+            verification=verification("integration"),
+            required_validator_ids=frozenset({"unit", "integration"}),
+        )
+
+        self.assertFalse(reloaded.workspace_dirty)
+
+    def test_later_required_failure_invalidates_previous_pass(self) -> None:
+        state = self.dirty_executing_state()
+        state = self.machine.record_verification_started(state)
+        state = self.machine.record_verification_finished(
+            state,
+            verification=verification("tests"),
+            required_validator_ids=frozenset({"tests"}),
+        )
+        self.assertFalse(state.workspace_dirty)
+
+        state = self.machine.record_verification_started(state)
+        state = self.machine.record_verification_finished(
+            state,
+            verification=verification("tests", passed=False),
+            required_validator_ids=frozenset({"tests"}),
+        )
+
+        self.assertTrue(state.workspace_dirty)
 
     def test_clarification_suspends_and_resumes_previous_phase(self) -> None:
         clarification = self.parse(

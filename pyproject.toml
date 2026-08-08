@@ -13,6 +13,9 @@ dependencies = [
     "pydantic>=2.12,<3",
 ]
 
+[project.scripts]
+harness-agent = "harness_agent.cli.main:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<10",

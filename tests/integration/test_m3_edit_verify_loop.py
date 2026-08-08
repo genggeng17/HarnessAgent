@@ -40,21 +40,25 @@ class M3EditVerifyLoopTests(unittest.IsolatedAsyncioTestCase):
         responses: list[str],
         *,
         guard: LoopGuard | None = None,
+        validators: list[ValidatorConfig] | None = None,
     ) -> AgentLoop:
         executor = ShellExecutor()
-        validator = ValidatorConfig(
-            id="value",
-            argv=(
-                sys.executable,
-                "-c",
-                "from pathlib import Path; raise SystemExit(0 if Path('value.txt').read_text().strip() == 'good' else 1)",
-            ),
-        )
+        if validators is None:
+            validators = [
+                ValidatorConfig(
+                    id="value",
+                    argv=(
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; raise SystemExit(0 if Path('value.txt').read_text().strip() == 'good' else 1)",
+                    ),
+                )
+            ]
         registry = ToolRegistry(
             [
                 ApplyPatchTool(),
                 RunShellTool(executor),
-                RunVerificationTool(executor, [validator]),
+                RunVerificationTool(executor, validators),
             ]
         )
         return AgentLoop(
@@ -101,6 +105,85 @@ class M3EditVerifyLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.state.workspace_revision, 1)
             self.assertFalse(result.state.workspace_dirty)
             self.assertTrue(result.verification_results[0].passed)
+            self.assertEqual(result.state.modified_paths, ("value.txt",))
+            self.assertEqual(len(result.state.verification_history), 1)
+
+    async def test_testing_contract_exposes_validator_and_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loop = self.make_loop(root, [])
+
+            contract = loop._testing_contract()
+
+            self.assertIn("修改前先查看", contract)
+            self.assertIn("优先复用已有测试", contract)
+            self.assertIn("value", contract)
+
+    async def test_auto_discovered_generated_test_can_complete_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "value.txt").write_text("bad\n", encoding="utf-8")
+            patch = replacement("bad", "good") + (
+                "--- /dev/null\n"
+                "+++ b/tests/test_value.py\n"
+                "@@ -0,0 +1,4 @@\n"
+                "+from pathlib import Path\n"
+                "+\n"
+                "+def test_value():\n"
+                "+    assert Path('value.txt').read_text().strip() == 'good'\n"
+            )
+            loop = self.make_loop(
+                root,
+                [
+                    self.plan(),
+                    action("tool_call", tool="apply_patch", arguments={"patch": patch}),
+                    action(
+                        "tool_call",
+                        tool="run_verification",
+                        arguments={"validator_id": "auto"},
+                    ),
+                    action("final", outcome="success", message="新增测试并验证完成"),
+                ],
+                validators=[],
+            )
+
+            result = await loop.run("修改 value 并补充测试")
+
+            self.assertEqual(result.state.phase, TurnPhase.COMPLETED)
+            self.assertFalse(result.state.workspace_dirty)
+            self.assertEqual(
+                result.state.verification_history[-1].validator_id, "python_tests"
+            )
+
+    async def test_failed_auto_discovery_cannot_bypass_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "value.txt").write_text("bad\n", encoding="utf-8")
+            loop = self.make_loop(
+                root,
+                [
+                    self.plan(),
+                    action(
+                        "tool_call",
+                        tool="apply_patch",
+                        arguments={"patch": replacement("bad", "good")},
+                    ),
+                    action(
+                        "tool_call",
+                        tool="run_verification",
+                        arguments={"validator_id": "auto"},
+                    ),
+                    action("final", outcome="success", message="错误放行"),
+                    action("final", outcome="partial", message="缺少可用测试"),
+                ],
+                validators=[],
+            )
+
+            result = await loop.run("修改但没有测试配置")
+
+            self.assertEqual(result.state.phase, TurnPhase.FAILED)
+            self.assertTrue(result.state.workspace_dirty)
+            self.assertFalse(result.state.verification_history[-1].passed)
 
     async def test_first_verification_fails_then_second_write_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -80,6 +80,35 @@ class PatchAndVerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(raw.command_log_ref)
         self.assertIn("ok", Path(raw.command_log_ref or "").read_text(encoding="utf-8"))
 
+    async def test_auto_verification_discovers_tests_created_during_turn(self) -> None:
+        tests = self.root / "tests"
+        tests.mkdir()
+        (tests / "test_generated.py").write_text(
+            "def test_generated():\n    assert True\n",
+            encoding="utf-8",
+        )
+        tool = RunVerificationTool(ShellExecutor(), [])
+        dispatcher = ToolDispatcher(ToolRegistry([tool]))
+
+        raw = await dispatcher.dispatch(
+            "run_verification", {"validator_id": "auto"}, self.workspace, self.context
+        )
+
+        self.assertEqual(raw.status, ToolResultStatus.SUCCEEDED)
+        self.assertEqual(raw.data["validator_id"], "python_tests")
+        self.assertTrue(raw.data["required"])
+
+    async def test_auto_verification_fails_clearly_without_test_marker(self) -> None:
+        tool = RunVerificationTool(ShellExecutor(), [])
+        dispatcher = ToolDispatcher(ToolRegistry([tool]))
+
+        raw = await dispatcher.dispatch(
+            "run_verification", {"validator_id": "auto"}, self.workspace, self.context
+        )
+
+        self.assertEqual(raw.status, ToolResultStatus.INVALID_ARGUMENTS)
+        self.assertIn("没有发现可用测试命令", raw.error or "")
+
     def test_verification_failure_timeout_and_start_failure_are_objective(self) -> None:
         service = VerificationService()
         cases = [

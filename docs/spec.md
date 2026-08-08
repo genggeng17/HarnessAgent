@@ -410,21 +410,21 @@ HarnessAgent/
 
 ### M4：审批与崩溃恢复纵向切片
 
-状态：待开始。
+状态：已完成。
 
 实现 ASK/DENY、PendingInteraction、ApprovalGrant、最小 TurnStore、DISPATCHING 和 EXECUTION_UNKNOWN。完成标准：允许、拒绝、中止、重复恢复以及崩溃窗口处理均可离线测试。
 
 ### M5：Session、CLI 与完整持久化
 
-状态：待开始。
+状态：已完成。
 
 实现 ProjectRuntime、SessionManager、TurnManager、交互式 CLI、EventBus、TraceWriter、CommandLog 和恢复命令。完成标准：程序退出后可以恢复 Session 和等待中的 Turn，并展示主要执行时间线。
 
 ### M6：治理补全、长期记忆与真实 Provider
 
-状态：待开始。
+状态：已完成。
 
-补全三种权限模式、命令规则、Project/Decision Memory 和 GLM 5.2 Provider，执行全部验收场景。完成标准：满足第 10 节所有第一阶段完成条件。
+补全三种权限模式、命令规则、Project/Decision Memory 和 DeepSeek-V4-Pro Provider，执行全部验收场景。完成标准：满足第 10 节所有第一阶段完成条件。
 
 ## 13. 第一阶段实施契约
 
@@ -549,6 +549,10 @@ Store 最低接口为：SessionStore 的 `create/load/list_resumable/append_mess
 
 `.agent/config.json` 使用版本化 Pydantic Schema，未知字段报错。除 13.1 默认值外，至少支持 permission mode、validators、只读命令 allowlist、是否允许幂等未知执行自动重试和是否启用长期记忆。
 
-真实 Provider 使用 GLM 5.2：默认 base URL 为 `https://open.bigmodel.cn/api/paas/v4`，模型名为 `glm-5.2`，调用 `/chat/completions`；base URL 可切换到 Coding Plan 端点。API Key 只从 `HARNESS_AGENT_GLM_API_KEY` 环境变量读取，不写入项目文件。第一阶段使用 `stream=false`、`do_sample=false` 和 JSON 结构化输出，只解析 assistant content，不把 reasoning content 注入下一轮上下文。网络超时、429 和 5xx 最多重试两次；格式错误交给 AgentLoop 的 Action 修正流程，不在 Provider 内猜测修复。
+验证进度必须保存在 TurnState 中而不是单次调用的临时内存：同一 revision 的多个必需验证器可分次通过并在恢复后继续，任何后续写入都会让旧 revision 的通过结果失效。必需验证器集合为空、验证命令未注册或验证失败时不得清除 dirty。模型在修改任务中应先复用已有测试，缺少覆盖时补写测试；真实退出码、命令日志和 revision 关联由 Harness 强制记录，不能只依赖 Prompt 或模型自述。
+
+真实 Provider 使用 DeepSeek-V4-Pro：默认通过兼容 base URL `https://njusehub.info/v1` 调用 `/chat/completions`，模型名固定为 `deepseek-v4-pro`。启动时先读取项目根目录下被 Git 忽略的 `.env`，API Key 再从 `NEW_API_KEY` 环境变量取得；当前进程已经设置的同名变量优先，真实密钥不得写入受版本控制的文件。第一阶段使用 `stream=false`、`temperature=0` 和 JSON 结构化输出，只解析 assistant content，不把推理内容注入下一轮上下文。网络超时、429 和 5xx 最多重试两次；格式错误交给 AgentLoop 的 Action 修正流程，不在 Provider 内猜测修复。
+
+真实模型上下文必须包含与 ActionParser 同源生成的完整 Action JSON Schema、每种 Action 的最小示例和全部工具 Schema。AgentLoop 在每轮请求时临时附加当前 phase、plan、workspace revision、验证进度、权限模式、合法下一步和剩余资源，不把该动态快照持久化到 transcript；格式错误回灌必须包含精确纠错结构。根目录 `AGENTS.md` 可作为受长度限制的项目规则来源，`.env` 和其他密钥内容不得进入模型上下文。
 
 Project Memory 最低支持 `list/select/upsert/invalidate`，事实必须带来源路径、证据摘要和更新时间；Decision Memory 最低支持 `list/select/append`，只接受用户明确确认或项目规范中已有的决定。两类记忆都不自动保存模型推测。CLI `/resume` 在只有一个可恢复目标时直接选择；存在多个目标时必须展示列表让用户选择。

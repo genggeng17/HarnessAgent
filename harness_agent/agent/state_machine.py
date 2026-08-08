@@ -16,6 +16,14 @@ from harness_agent.agent.actions import (
     UpdatePlanAction,
 )
 from harness_agent.agent.state import PlanItem, TERMINAL_PHASES, TurnPhase, TurnState
+from harness_agent.agent.verification import VerificationResult
+from harness_agent.agent.interactions import (
+    ApprovalGrant,
+    ApprovalGrantStatus,
+    PendingInteraction,
+    ToolExecution,
+    ToolExecutionStatus,
+)
 
 
 class TransitionErrorCode(StrEnum):
@@ -82,7 +90,7 @@ class StateMachine:
         elif isinstance(action, ReflectAction):
             new_state = self._apply_reflect(state)
         elif isinstance(action, AskClarificationAction):
-            new_state = self._apply_clarification(state)
+            new_state = self._apply_clarification(state, action)
         elif isinstance(action, FinalAction):
             new_state = self._apply_final(state, action)
         else:  # pragma: no cover - Action 联合类型未来扩展时的安全网
@@ -112,7 +120,27 @@ class StateMachine:
             return False
         return has_side_effect or state.tool_calls >= 2
 
-    def resume_waiting(self, state: TurnState, *, abort: bool = False) -> TurnState:
+    def wait_for_approval(
+        self, state: TurnState, pending: PendingInteraction
+    ) -> TurnState:
+        """把已接受但尚未派发的工具调用暂停为审批请求。"""
+
+        self._require_phase(state, {TurnPhase.PREPARING, TurnPhase.EXECUTING, TurnPhase.VERIFYING})
+        if pending.tool_call is None:
+            raise ValueError("审批请求必须绑定工具调用")
+        return self._replace(
+            state,
+            phase=TurnPhase.WAITING_FOR_USER,
+            suspended_phase=state.phase,
+            pending_interaction=pending,
+        )
+
+    def resume_waiting(
+        self,
+        state: TurnState,
+        *,
+        abort: bool = False,
+    ) -> TurnState:
         """恢复等待中的 Turn，或按用户选择中止。"""
 
         if state.phase != TurnPhase.WAITING_FOR_USER:
@@ -122,10 +150,93 @@ class StateMachine:
             )
         if abort:
             return self._replace(
-                state, phase=TurnPhase.ABORTED, suspended_phase=None
+                state,
+                phase=TurnPhase.ABORTED,
+                suspended_phase=None,
+                pending_interaction=None,
             )
         return self._replace(
-            state, phase=state.suspended_phase, suspended_phase=None
+            state,
+            phase=state.suspended_phase,
+            suspended_phase=None,
+            pending_interaction=None,
+        )
+
+    def start_approved_dispatch(
+        self,
+        state: TurnState,
+        *,
+        grant: ApprovalGrant,
+        execution: ToolExecution,
+        verification: bool = False,
+    ) -> TurnState:
+        """原子消费批准，并在外部调用前记录 DISPATCHING。"""
+
+        if state.phase != TurnPhase.WAITING_FOR_USER:
+            raise StateTransitionError(TransitionErrorCode.NOT_WAITING, "当前没有等待审批")
+        pending = state.pending_interaction
+        if pending is None or pending.tool_call is None or not grant.matches(pending.tool_call):
+            raise StateTransitionError(
+                TransitionErrorCode.ACTION_NOT_ALLOWED,
+                "批准与等待中的工具调用不匹配",
+            )
+        if execution.status != ToolExecutionStatus.DISPATCHING:
+            raise ValueError("审批恢复只能从 DISPATCHING 开始")
+        consumed = grant.model_copy(update={"status": ApprovalGrantStatus.CONSUMED})
+        return self._replace(
+            state,
+            phase=TurnPhase.VERIFYING if verification else state.suspended_phase,
+            suspended_phase=None,
+            pending_interaction=None,
+            approval_grant=consumed,
+            tool_execution=execution,
+            tool_calls=state.tool_calls + 1,
+        )
+
+    def mark_tool_dispatching(self, state: TurnState, execution: ToolExecution) -> TurnState:
+        """在执行普通工具前记录 DISPATCHING，供崩溃恢复使用。"""
+
+        self._require_non_terminal(state)
+        if execution.status != ToolExecutionStatus.DISPATCHING:
+            raise ValueError("工具开始时状态必须为 DISPATCHING")
+        return self._replace(state, tool_execution=execution)
+
+    def record_tool_finished(
+        self,
+        state: TurnState,
+        *,
+        succeeded: bool,
+        error: str | None = None,
+    ) -> TurnState:
+        """记录工具已经返回，避免恢复时将其误认为未完成。"""
+
+        if state.tool_execution is None:
+            raise ValueError("没有正在执行的工具调用")
+        execution = state.tool_execution.model_copy(
+            update={
+                "status": ToolExecutionStatus.SUCCEEDED if succeeded else ToolExecutionStatus.FAILED,
+                "error": error,
+            }
+        )
+        return self._replace(state, tool_execution=execution)
+
+    def mark_execution_unknown(self, state: TurnState) -> TurnState:
+        """恢复时发现 DISPATCHING；绝不自动重复派发。"""
+
+        execution = state.tool_execution
+        if execution is None or execution.status != ToolExecutionStatus.DISPATCHING:
+            raise ValueError("只有 DISPATCHING 工具调用可标记为未知")
+        unknown = execution.model_copy(update={"status": ToolExecutionStatus.EXECUTION_UNKNOWN})
+        pending = PendingInteraction(
+            kind="execution_unknown",
+            prompt="上次工具调用可能已经开始执行，结果无法确认。请检查工作区后决定下一步。",
+        )
+        return self._replace(
+            state,
+            phase=TurnPhase.WAITING_FOR_USER,
+            suspended_phase=state.phase,
+            pending_interaction=pending,
+            tool_execution=unknown,
         )
 
     def record_iteration(self, state: TurnState) -> TurnState:
@@ -140,14 +251,18 @@ class StateMachine:
         self._require_non_terminal(state)
         return self._replace(state, tool_calls=state.tool_calls + 1)
 
-    def record_write_succeeded(self, state: TurnState) -> TurnState:
+    def record_write_succeeded(
+        self, state: TurnState, *, modified_paths: tuple[str, ...] = ()
+    ) -> TurnState:
         """成功写入后递增工作区 revision 并使验证失效。"""
 
         self._require_non_terminal(state)
+        known_paths = dict.fromkeys((*state.modified_paths, *modified_paths))
         return self._replace(
             state,
             workspace_dirty=True,
             workspace_revision=state.workspace_revision + 1,
+            modified_paths=tuple(known_paths),
         )
 
     def record_verification_started(self, state: TurnState) -> TurnState:
@@ -157,15 +272,33 @@ class StateMachine:
         return self._replace(state, phase=TurnPhase.VERIFYING)
 
     def record_verification_finished(
-        self, state: TurnState, *, all_required_passed: bool
+        self,
+        state: TurnState,
+        *,
+        verification: VerificationResult,
+        required_validator_ids: frozenset[str],
     ) -> TurnState:
-        """验证完成后回到 EXECUTING；全部必需验证通过才清除 dirty。"""
+        """持久化验证证据；非空必需集合在当前 revision 全通过才清除 dirty。"""
 
         self._require_phase(state, {TurnPhase.VERIFYING})
+        if verification.workspace_revision != state.workspace_revision:
+            raise ValueError("验证结果与当前工作区 revision 不一致")
+        history = (*state.verification_history, verification)
+        latest: dict[str, VerificationResult] = {}
+        for result in history:
+            if result.workspace_revision == state.workspace_revision:
+                latest[result.validator_id] = result
+        all_required_passed = bool(required_validator_ids) and all(
+            latest.get(validator_id) is not None
+            and latest[validator_id].passed
+            for validator_id in required_validator_ids
+        )
         return self._replace(
             state,
             phase=TurnPhase.EXECUTING,
-            workspace_dirty=state.workspace_dirty and not all_required_passed,
+            workspace_dirty=(state.workspace_dirty or state.workspace_revision > 0)
+            and not all_required_passed,
+            verification_history=history,
         )
 
     def fail(self, state: TurnState, message: str) -> TurnState:
@@ -253,7 +386,9 @@ class StateMachine:
             reflections=state.reflections + 1,
         )
 
-    def _apply_clarification(self, state: TurnState) -> TurnState:
+    def _apply_clarification(
+        self, state: TurnState, action: AskClarificationAction
+    ) -> TurnState:
         self._require_phase(
             state,
             {TurnPhase.PREPARING, TurnPhase.PLANNING, TurnPhase.EXECUTING},
@@ -262,6 +397,7 @@ class StateMachine:
             state,
             phase=TurnPhase.WAITING_FOR_USER,
             suspended_phase=state.phase,
+            pending_interaction=PendingInteraction.clarification(prompt=action.question),
         )
 
     def _apply_final(self, state: TurnState, action: FinalAction) -> TurnState:

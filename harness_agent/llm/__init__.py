@@ -5,3 +5,4 @@ from harness_agent.llm.mock import MockLLMClient
 
 __all__ = ["ChatMessage", "LLMClient", "LLMResponse", "MockLLMClient"]
 
+"""模型端口、Mock 与 DeepSeek 适配器。"""

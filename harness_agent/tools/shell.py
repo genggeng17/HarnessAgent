@@ -110,12 +110,18 @@ class ShellExecutor:
     ) -> str | None:
         if context.command_log_dir is None:
             return None
-        context.command_log_dir.mkdir(parents=True, exist_ok=True)
-        path = context.command_log_dir / f"{tool_call_id}.log"
         body = (
             f"argv={list(argv)!r}\ncwd={cwd}\n\n"
             f"[stdout]\n{stdout}\n[stderr]\n{stderr}"
         )
+        if context.command_log_dir.suffix == ".log":
+            path = context.command_log_dir
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(f"\n--- tool_call_id={tool_call_id} ---\n{body}\n")
+            return f"{path}#{tool_call_id}"
+        context.command_log_dir.mkdir(parents=True, exist_ok=True)
+        path = context.command_log_dir / f"{tool_call_id}.log"
         path.write_text(body, encoding="utf-8")
         return str(path)
 

@@ -30,8 +30,11 @@ class WorkspaceToolsTests(unittest.IsolatedAsyncioTestCase):
     def test_rejects_absolute_parent_and_symlink_escape(self) -> None:
         outside = self.root.parent / f"{self.root.name}-outside.txt"
         outside.write_text("secret", encoding="utf-8")
-        (self.root / "escape").symlink_to(outside)
         self.addCleanup(outside.unlink)
+        try:
+            (self.root / "escape").symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"当前 Windows 账户无法创建符号链接：{exc.winerror}")
 
         with self.assertRaises(WorkspacePathError):
             self.workspace.resolve_path("../outside")
