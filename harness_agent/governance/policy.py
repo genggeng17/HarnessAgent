@@ -86,6 +86,11 @@ class PolicyEngine:
         values = tuple(argv)
         if self._is_dangerous_command(values):
             return PolicyDecision(outcome=PolicyOutcome.DENY, reason="命令会丢弃修改或破坏系统")
+        if self._looks_like_file_edit_script(values):
+            return PolicyDecision(
+                outcome=PolicyOutcome.DENY,
+                reason="禁止用 Shell、临时脚本或字符串替换命令修改源码；请使用受控文件修改工具",
+            )
         if self._is_readonly_git(values):
             return PolicyDecision(outcome=PolicyOutcome.ALLOW, reason="已允许的只读 Git 命令")
         if self.mode == PermissionMode.READ_ONLY:
@@ -114,3 +119,31 @@ class PolicyEngine:
         joined = " ".join(argv).lower()
         markers = ("rm -rf /", "rm -rf .", "rmdir /s", "del /s", "format ", "shutdown ", "reboot", "fork bomb")
         return any(marker in joined for marker in markers)
+
+    @staticmethod
+    def _looks_like_file_edit_script(argv: tuple[str, ...]) -> bool:
+        """识别常见的 Shell 写文件兜底，避免 Patch 失败后绕过受控工具。"""
+
+        joined = " ".join(argv).lower()
+        executable = argv[0].lower() if argv else ""
+        script_markers = (
+            "write_text(",
+            "write_bytes(",
+            "writefile(",
+            "writefilesync(",
+            "set-content",
+            "add-content",
+            "out-file",
+            "writealltext",
+            "writeallbytes",
+        )
+        if any(marker in joined for marker in script_markers):
+            return True
+        if executable in {"sed", "perl"} and any(
+            item in {"-i", "-pi", "-p-i"} or item.startswith("-i")
+            for item in argv[1:]
+        ):
+            return True
+        if executable in {"cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh"}:
+            return any(marker in joined for marker in (">", "copy ", "move "))
+        return False

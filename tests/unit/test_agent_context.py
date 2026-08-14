@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from harness_agent.agent.action_parser import ActionParser
+from harness_agent.agent.context import build_task_contract, curate_messages
 from harness_agent.agent.loop import AgentLoop
 from harness_agent.agent.loop_guard import LoopGuard
 from harness_agent.agent.state_machine import StateMachine
@@ -82,6 +83,7 @@ class AgentContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(
                 '"prefer_dedicated_read_tools_over_shell":true', snapshot.content
             )
+            self.assertIn('"original_request":"直接回答"', snapshot.content)
             self.assertTrue(
                 any("所有回答使用中文" in message.content for message in client.calls[0])
             )
@@ -112,6 +114,28 @@ class AgentContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["correction"]["schema_version"], 1)
             self.assertIn("tool_call", payload["correction"]["allowed_types"])
             self.assertIn("action", payload["correction"]["forbidden_wrappers"])
+
+    async def test_old_history_is_trimmed_but_original_task_is_kept(self) -> None:
+        contract = build_task_contract("完成任务\n- 不要使用 Shell")
+        messages = [
+            ChatMessage(role=MessageRole.USER, content="很早以前的任务"),
+            *[
+                ChatMessage(role=MessageRole.TOOL, content=f"旧证据-{index}-" + "x" * 100)
+                for index in range(20)
+            ],
+        ]
+
+        selected = curate_messages(
+            messages,
+            task_contract=contract,
+            recent_messages=4,
+            max_chars=2_000,
+        )
+
+        self.assertLessEqual(len(selected), 5)
+        self.assertTrue(any(message.content == contract.original_request for message in selected))
+        self.assertFalse(any("旧证据-0" in message.content for message in selected))
+        self.assertTrue(contract.requirements[1].prohibition)
 
 
 if __name__ == "__main__":

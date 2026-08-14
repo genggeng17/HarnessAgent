@@ -24,6 +24,7 @@ from harness_agent.agent.interactions import (
     ToolExecution,
     ToolExecutionStatus,
 )
+from harness_agent.agent.context import EditRecovery, FileSnapshot, TaskContract
 
 
 class TransitionErrorCode(StrEnum):
@@ -245,6 +246,43 @@ class StateMachine:
         self._require_non_terminal(state)
         return self._replace(state, iterations=state.iterations + 1)
 
+    def record_task_contract(
+        self, state: TurnState, contract: TaskContract
+    ) -> TurnState:
+        """只允许在任务开始时写入一次原始任务卡。"""
+
+        self._require_non_terminal(state)
+        if state.task_contract is not None:
+            if state.task_contract != contract:
+                raise ValueError("当前 Turn 的原始任务卡不可改写")
+            return state
+        return self._replace(state, task_contract=contract)
+
+    def record_file_read(self, state: TurnState, snapshot: FileSnapshot) -> TurnState:
+        """保存模型看到的最新文件版本。"""
+
+        self._require_non_terminal(state)
+        snapshots = {item.path: item for item in state.file_snapshots}
+        snapshots[snapshot.path] = snapshot
+        recovery = state.edit_recovery
+        if (
+            recovery is not None
+            and recovery.path == snapshot.path
+            and snapshot.complete
+        ):
+            recovery = recovery.model_copy(update={"require_full_read": False})
+        return self._replace(
+            state,
+            file_snapshots=tuple(snapshots[path] for path in sorted(snapshots)),
+            edit_recovery=recovery,
+        )
+
+    def record_edit_failure(self, state: TurnState, recovery: EditRecovery) -> TurnState:
+        """记录当前任务内的修改恢复范围。"""
+
+        self._require_non_terminal(state)
+        return self._replace(state, edit_recovery=recovery)
+
     def record_tool_call(self, state: TurnState) -> TurnState:
         """记录一次已接受的工具调用。"""
 
@@ -258,11 +296,22 @@ class StateMachine:
 
         self._require_non_terminal(state)
         known_paths = dict.fromkeys((*state.modified_paths, *modified_paths))
+        snapshots = tuple(
+            item.model_copy(update={"stale": True})
+            if item.path in modified_paths
+            else item
+            for item in state.file_snapshots
+        )
+        recovery = state.edit_recovery
+        if recovery is not None and recovery.path in modified_paths:
+            recovery = None
         return self._replace(
             state,
             workspace_dirty=True,
             workspace_revision=state.workspace_revision + 1,
             modified_paths=tuple(known_paths),
+            file_snapshots=snapshots,
+            edit_recovery=recovery,
         )
 
     def record_verification_started(self, state: TurnState) -> TurnState:
@@ -371,7 +420,10 @@ class StateMachine:
                 "同一时刻最多一个计划项处于 in_progress",
             )
         return self._replace(
-            state, phase=TurnPhase.EXECUTING, plan=tuple(updated_plan)
+            state,
+            phase=TurnPhase.EXECUTING,
+            plan=tuple(updated_plan),
+            plan_updates=state.plan_updates + 1,
         )
 
     def _apply_tool_call(self, state: TurnState) -> TurnState:

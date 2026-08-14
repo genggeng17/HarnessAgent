@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,7 +75,7 @@ class M6ConfigMemoryProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deepseek_requires_key(self) -> None:
         with self.assertRaises(DeepSeekConfigurationError):
-            DeepSeekClient(api_key="", api_key_env="MISSING_DEEPSEEK_TEST_KEY")
+            DeepSeekClient(api_key="")
 
     async def test_deepseek_retries_rate_limit_then_returns_response(self) -> None:
         attempts = 0
@@ -166,21 +165,17 @@ class M6ConfigMemoryProviderTests(unittest.IsolatedAsyncioTestCase):
                 load_project_config(root)
             self.assertEqual(ProjectConfig().deepseek.model, "deepseek-v4-pro")
 
-    async def test_project_env_supplies_api_key_without_overriding_process(self) -> None:
+    async def test_project_env_is_not_loaded_as_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".env").write_text(
                 "# 本地密钥\nNEW_API_KEY='from-env-file'\n",
                 encoding="utf-8",
             )
-            with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("NEW_API_KEY", None)
-                config = load_project_config(root)
-                self.assertEqual(config.api_key(), "from-env-file")
+            config = load_project_config(root)
 
-            with patch.dict(os.environ, {"NEW_API_KEY": "from-process"}, clear=False):
-                config = load_project_config(root)
-                self.assertEqual(config.api_key(), "from-process")
+            self.assertEqual(config.deepseek.credential_name, "deepseek-v4-pro")
+            self.assertFalse(hasattr(config.deepseek, "api_key_env"))
 
     async def test_config_detects_multiple_real_test_systems(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

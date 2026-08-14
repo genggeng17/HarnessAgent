@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -31,15 +30,15 @@ class DeepSeekClient(LLMClient):
         api_key: str | None = None,
         base_url: str = "https://njusehub.info/v1",
         model: str = "deepseek-v4-pro",
-        api_key_env: str = "NEW_API_KEY",
         timeout_seconds: float = 60,
         max_retries: int = 2,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get(api_key_env)
+        self.api_key = api_key
         if not self.api_key:
             raise DeepSeekConfigurationError(
-                f"未设置 DeepSeek API Key，请设置环境变量 {api_key_env}"
+                "未设置 DeepSeek API Key，请使用 `harness-agent credentials set` "
+                "安全录入系统钥匙串"
             )
         if model != "deepseek-v4-pro":
             raise DeepSeekConfigurationError("第一阶段真实模型固定为 deepseek-v4-pro")

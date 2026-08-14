@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
+import sys
 from pathlib import Path
 
 from harness_agent.agent.action_parser import ActionParser
@@ -12,6 +14,12 @@ from harness_agent.agent.loop import AgentLoop
 from harness_agent.agent.loop_guard import LoopGuard
 from harness_agent.agent.state_machine import StateMachine
 from harness_agent.agent.verification import VerificationService
+from harness_agent.config.models import ProjectConfig, load_project_config
+from harness_agent.credentials import (
+    CredentialManager,
+    CredentialSource,
+    resolve_api_key,
+)
 from harness_agent.governance.policy import PolicyEngine
 from harness_agent.llm.base import LLMClient
 from harness_agent.llm.deepseek import DeepSeekClient
@@ -19,7 +27,7 @@ from harness_agent.llm.mock import MockLLMClient
 from harness_agent.runtime.manager import ProjectRuntime, SessionManager, TurnManager
 from harness_agent.tools.dispatcher import ToolDispatcher
 from harness_agent.tools.models import ExecutionContext
-from harness_agent.tools.patch import ApplyPatchTool
+from harness_agent.tools.patch import ApplyPatchTool, BatchExactEditTool, ExactEditTool
 from harness_agent.tools.readonly import readonly_tools
 from harness_agent.tools.registry import ToolRegistry
 from harness_agent.tools.shell import RunShellTool, ShellExecutor
@@ -36,7 +44,73 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="可选的离线测试响应文件；省略时调用 DeepSeek-V4-Pro",
     )
+    commands = parser.add_subparsers(dest="command")
+    credentials = commands.add_parser(
+        "credentials", help="在系统钥匙串中管理 DeepSeek API Key"
+    )
+    credential_actions = credentials.add_subparsers(
+        dest="credential_action", required=True
+    )
+    credential_actions.add_parser("set", help="隐藏录入并保存 API Key")
+    credential_actions.add_parser("update", help="隐藏录入并覆盖已有 API Key")
+    credential_actions.add_parser("status", help="查看配置状态，不回显明文")
+    credential_actions.add_parser("clear", help="清除系统钥匙串中的 API Key")
     return parser
+
+
+def _credential_command(
+    action: str,
+    config: ProjectConfig,
+    manager: CredentialManager,
+) -> int:
+    """执行凭据子命令，所有输出均不包含 Key 明文。"""
+
+    credential_name = config.deepseek.credential_name
+    if action in {"set", "update"}:
+        verb = "更新" if action == "update" else "保存"
+        value = getpass.getpass("DeepSeek API Key（输入隐藏）> ")
+        manager.set(credential_name, value)
+        print(f"已在系统钥匙串中{verb} DeepSeek API Key。")
+        return 0
+    if action == "status":
+        resolved = resolve_api_key(credential_name, manager)
+        if resolved is None:
+            print("DeepSeek API Key：未配置。")
+        else:
+            print("DeepSeek API Key：已在系统钥匙串中配置。")
+        return 0
+    if action == "clear":
+        removed = manager.clear(credential_name)
+        if removed:
+            print("已清除系统钥匙串中的 DeepSeek API Key。")
+        else:
+            print("系统钥匙串中没有 DeepSeek API Key，无需清除。")
+        return 0
+    raise ValueError(f"未知凭据操作：{action}")
+
+
+def _resolve_or_prompt_api_key(
+    config: ProjectConfig,
+    manager: CredentialManager,
+) -> str:
+    """首次真实运行缺少 Key 时，以隐藏输入引导保存到系统钥匙串。"""
+
+    credential_name = config.deepseek.credential_name
+    resolved = resolve_api_key(credential_name, manager)
+    if resolved is not None:
+        return resolved.value
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "未配置 DeepSeek API Key；请先运行 "
+            "`harness-agent credentials set` 安全录入系统钥匙串"
+        )
+    print("首次运行尚未配置 DeepSeek API Key，将安全保存到系统钥匙串。")
+    value = getpass.getpass("DeepSeek API Key（输入隐藏，直接回车取消）> ")
+    if not value.strip():
+        raise RuntimeError("已取消 API Key 录入")
+    manager.set(credential_name, value)
+    print("API Key 已保存；状态查询不会回显明文。")
+    return value.strip()
 
 
 def _load_mock_responses(path: Path) -> list[str]:
@@ -52,6 +126,8 @@ def _build_loop(runtime: ProjectRuntime, client: LLMClient) -> AgentLoop:
         [
             *readonly_tools(),
             ApplyPatchTool(),
+            ExactEditTool(),
+            BatchExactEditTool(),
             RunShellTool(executor),
             RunVerificationTool(executor, runtime.config.validators),
         ]
@@ -186,14 +262,23 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "credentials":
+            project_root = args.project.resolve(strict=True)
+            config = load_project_config(project_root)
+            return _credential_command(
+                args.credential_action, config, CredentialManager()
+            )
         runtime = ProjectRuntime.open(args.project)
         if args.mock_responses:
             client: LLMClient = MockLLMClient(_load_mock_responses(args.mock_responses))
         else:
+            api_key = _resolve_or_prompt_api_key(
+                runtime.config, CredentialManager()
+            )
             client = DeepSeekClient(
+                api_key=api_key,
                 base_url=runtime.config.deepseek.base_url,
                 model=runtime.config.deepseek.model,
-                api_key_env=runtime.config.deepseek.api_key_env,
                 timeout_seconds=runtime.config.deepseek.timeout_seconds,
                 max_retries=runtime.config.deepseek.max_retries,
             )

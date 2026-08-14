@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "validators": [
+    {
+      "id": "python_tests",
+      "argv": ["python", "-m", "pytest"],
+      "cwd": ".",
+      "timeout_seconds": 60,
+      "required": true
+    }
+  ],
+  "loop_guard": {
+    "max_iterations": 36,
+    "max_tool_calls": 48,
+    "max_reflections": 3,
+    "repeated_action_limit": 3
+  }
+}
+

@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Awaitable, Callable, Sequence
 
 from pydantic import BaseModel, ConfigDict
 
-from harness_agent.agent.action_parser import ActionParseError, ActionParser, ParsedAction
-from harness_agent.agent.actions import FinalAction, ReflectAction, ToolCallAction
+from harness_agent.agent.action_parser import ActionParseError, ActionParser
+from harness_agent.agent.actions import (
+    FinalAction,
+    PlanAction,
+    ReflectAction,
+    ToolCallAction,
+    UpdatePlanAction,
+)
+from harness_agent.agent.context import (
+    EditRecovery,
+    FileSnapshot,
+    build_task_contract,
+    curate_messages,
+)
 from harness_agent.agent.interactions import (
     ApprovalGrant,
     InteractionKind,
@@ -30,7 +44,6 @@ from harness_agent.tools.models import (
     SideEffect,
     Tool,
     ToolKind,
-    ToolResult,
     ToolResultStatus,
     new_tool_call_id,
 )
@@ -95,6 +108,9 @@ class AgentLoop:
         state = initial_state or TurnState()
         if state.phase == TurnPhase.CREATED:
             state = self.state_machine.start(state)
+            state = self.state_machine.record_task_contract(
+                state, build_task_contract(user_task)
+            )
             await self._checkpoint(state_observer, state)
         messages = [*prior_messages]
         testing_contract = self._testing_contract()
@@ -214,7 +230,7 @@ class AgentLoop:
             await self._checkpoint(state_observer, state)
             tool_specs = self.dispatcher.registry.specs()
             request_messages = [
-                *messages,
+                *curate_messages(messages, task_contract=state.task_contract),
                 ChatMessage(
                     role=MessageRole.SYSTEM,
                     content=self._iteration_context(state),
@@ -239,7 +255,31 @@ class AgentLoop:
                 await self._checkpoint(state_observer, state)
                 break
             action = parsed.action
+            closing_stage = self._is_closing_stage(state)
+            if isinstance(action, (PlanAction, UpdatePlanAction)) and closing_stage:
+                messages.append(
+                    self._observation(
+                        "closing_stage",
+                        "已进入收尾阶段，不再建立或反复更新计划；请完成剩余修改、验证或结束任务",
+                    )
+                )
+                continue
+            if isinstance(action, UpdatePlanAction) and state.plan_updates >= 4:
+                messages.append(
+                    self._observation(
+                        "plan_update_limit",
+                        "计划更新次数已达上限；系统会根据真实工具和验证结果维护当前进度",
+                    )
+                )
+                continue
             if isinstance(action, ReflectAction):
+                if closing_stage:
+                    messages.append(
+                        self._observation(
+                            "closing_stage", "收尾阶段不再进行额外反思，请直接修复、验证或结束"
+                        )
+                    )
+                    continue
                 reflection_guard = self.loop_guard.before_reflection(state)
                 if not reflection_guard.allowed:
                     state = self.state_machine.fail(state, reflection_guard.message or "反思资源耗尽")
@@ -266,6 +306,42 @@ class AgentLoop:
                     continue
                 await self._checkpoint(state_observer, state)
                 messages.append(self._observation("tool_not_found", f"工具未注册：{action.tool}"))
+                continue
+            if closing_stage and action.tool in {"list_directory", "search_text"}:
+                messages.append(
+                    self._observation(
+                        "closing_stage",
+                        "收尾阶段禁止扩大调查范围；只读取明确相关文件、完成修改并运行验证",
+                    )
+                )
+                continue
+            recovery_block = self._check_recovery_write(state, tool, action.arguments)
+            if recovery_block is not None:
+                messages.append(self._observation("edit_recovery", recovery_block))
+                continue
+            if action.tool == "run_shell" and self._task_forbids_shell(state):
+                messages.append(
+                    self._observation(
+                        "policy_deny", "用户原始任务明确禁止 Shell，本次调用不会进入审批或执行"
+                    )
+                )
+                continue
+            baseline = self._baseline_verification_required(state, tool)
+            if baseline:
+                messages.append(
+                    self._observation(
+                        "baseline_verification_required",
+                        "首次修改前必须先运行所有已有的必需验证器，记录项目原始状态",
+                    )
+                )
+                continue
+            if self._midpoint_verification_required(state) and action.tool != "run_verification":
+                messages.append(
+                    self._observation(
+                        "midpoint_verification_required",
+                        "任务已过半且已有修改；继续增加修改前必须先测试当前版本，尽早发现错误",
+                    )
+                )
                 continue
             needs_plan = self.state_machine.requires_plan_for_tool(
                 state, has_side_effect=tool.side_effect != SideEffect.NONE
@@ -356,6 +432,57 @@ class AgentLoop:
                 state, modified_paths=result.modified_paths
             )
             await self._checkpoint(state_observer, state)
+
+        if tool.kind == ToolKind.WRITE and not succeeded:
+            failure = result.data.get("edit_failure")
+            if isinstance(failure, dict) and isinstance(failure.get("path"), str):
+                previous = state.edit_recovery
+                attempts = (
+                    previous.attempts + 1
+                    if previous is not None and previous.path == failure["path"]
+                    else 1
+                )
+                recovery = EditRecovery(
+                    path=str(failure["path"]),
+                    failure_kind=str(failure.get("kind", "unknown")),
+                    attempts=min(attempts, 3),
+                    latest_sha256=str(failure.get("latest_sha256") or "") or None,
+                    latest_excerpt=str(failure.get("latest_excerpt") or ""),
+                    require_full_read=attempts >= 2,
+                    blocked=attempts >= 3,
+                )
+                state = self.state_machine.record_edit_failure(state, recovery)
+                await self._checkpoint(state_observer, state)
+                if recovery.blocked:
+                    state = self.state_machine.fail(
+                        state,
+                        f"文件 {recovery.path} 连续修改失败 3 次，已停止，且不会改用 Shell 修改源码",
+                    )
+                    await self._checkpoint(state_observer, state)
+
+        if tool.kind == ToolKind.READ and succeeded:
+            raw_snapshots: list[dict[str, object]] = []
+            if result.data.get("path"):
+                raw_snapshots.append(result.data)
+            raw_files = result.data.get("files")
+            if isinstance(raw_files, list):
+                raw_snapshots.extend(
+                    item for item in raw_files if isinstance(item, dict)
+                )
+            recorded = False
+            for item in raw_snapshots:
+                if not item.get("path") or not item.get("sha256"):
+                    continue
+                file_snapshot = FileSnapshot(
+                    path=str(item["path"]),
+                    sha256=str(item["sha256"]),
+                    total_lines=int(item.get("total_lines", 0)),
+                    complete=bool(item.get("complete", False)),
+                )
+                state = self.state_machine.record_file_read(state, file_snapshot)
+                recorded = True
+            if recorded:
+                await self._checkpoint(state_observer, state)
 
         if tool.kind != ToolKind.VERIFICATION:
             messages.append(self._observation("tool_result", json.dumps(dumped, ensure_ascii=False)))
@@ -468,6 +595,9 @@ class AgentLoop:
             final_outcomes.insert(0, "success")
         config = self.loop_guard.config
         payload = {
+            "task_contract": state.task_contract.model_dump(mode="json")
+            if state.task_contract
+            else None,
             "turn_state": {
                 "phase": state.phase.value,
                 "workspace_dirty": state.workspace_dirty,
@@ -479,6 +609,13 @@ class AgentLoop:
                 "last_tool_execution": state.tool_execution.model_dump(mode="json")
                 if state.tool_execution
                 else None,
+                "file_snapshots": [
+                    item.model_dump(mode="json") for item in state.file_snapshots
+                ],
+                "edit_recovery": state.edit_recovery.model_dump(mode="json")
+                if state.edit_recovery
+                else None,
+                "plan_updates": state.plan_updates,
             },
             "budget": {
                 "iteration": state.iterations,
@@ -495,6 +632,11 @@ class AgentLoop:
                     config.max_reflections - state.reflections, 0
                 ),
                 "repeated_action_limit": config.repeated_action_limit,
+                "closing_stage": self._is_closing_stage(state),
+                "closing_stage_starts_at_iteration": math.ceil(
+                    config.max_iterations * 0.7
+                ),
+                "midpoint_verification_required": self._midpoint_verification_required(state),
             },
             "governance": {
                 "permission_mode": self.policy.mode.value,
@@ -517,6 +659,101 @@ class AgentLoop:
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             + "\n只返回一个符合完整 Action Schema 的 JSON 对象。"
             "如果需要工具结果，本轮只请求工具，不要同时编造最终答案。"
+            "task_contract 是用户原文形成的固定验收清单，不得被计划、实现或测试改写。"
+            "file_snapshots 中 stale=true 表示旧内容已失效，必须重新读取后再修改。"
+            "计划状态不需要在每次工具调用后更新，只有任务方向真正变化时才更新。"
+        )
+
+    def _baseline_verification_required(self, state: TurnState, tool: Tool) -> bool:
+        """首次写入前强制记录已有测试的原始状态。"""
+
+        if tool.kind != ToolKind.WRITE or state.workspace_revision != 0:
+            return False
+        verification_tool = self.dispatcher.registry.get("run_verification")
+        if not isinstance(verification_tool, RunVerificationTool):
+            return False
+        required = verification_tool.required_validator_ids
+        attempted = {
+            result.validator_id
+            for result in state.verification_history
+            if result.workspace_revision == 0
+        }
+        return bool(required - attempted)
+
+    def _midpoint_verification_required(self, state: TurnState) -> bool:
+        """任务过半后至少做一次修改后检查，避免错误拖到最后。"""
+
+        if not state.workspace_dirty:
+            return False
+        if any(result.workspace_revision > 0 for result in state.verification_history):
+            return False
+        return state.iterations >= math.ceil(
+            self.loop_guard.config.max_iterations * 0.6
+        )
+
+    def _check_recovery_write(
+        self, state: TurnState, tool: Tool, arguments: dict[str, object]
+    ) -> str | None:
+        """修改恢复期间冻结目标文件，并要求第二次失败后完整重读。"""
+
+        recovery = state.edit_recovery
+        if recovery is None or tool.kind != ToolKind.WRITE:
+            return None
+        paths = self._write_paths(tool.name, arguments)
+        if paths and paths != {recovery.path}:
+            return f"当前只允许恢复文件 {recovery.path}，不得顺便修改其他文件"
+        if recovery.blocked:
+            return f"文件 {recovery.path} 已达到修改失败上限"
+        if recovery.require_full_read:
+            snapshot = next(
+                (
+                    item
+                    for item in state.file_snapshots
+                    if item.path == recovery.path and item.complete and not item.stale
+                ),
+                None,
+            )
+            if snapshot is None or (
+                recovery.latest_sha256 is not None
+                and snapshot.sha256 != recovery.latest_sha256
+            ):
+                return f"再次修改 {recovery.path} 前，必须完整读取它的最新内容"
+        return None
+
+    @staticmethod
+    def _write_paths(tool_name: str, arguments: dict[str, object]) -> set[str]:
+        if tool_name == "edit_file" and isinstance(arguments.get("path"), str):
+            return {str(arguments["path"])}
+        if tool_name == "edit_files" and isinstance(arguments.get("edits"), list):
+            return {
+                str(item["path"])
+                for item in arguments["edits"]
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            }
+        if tool_name != "apply_patch":
+            return set()
+        patch = str(arguments.get("patch", ""))
+        paths: set[str] = set()
+        for match in re.finditer(r"^(?:---|\+\+\+)\s+(?:[ab]/)?([^\t\r\n]+)", patch, re.MULTILINE):
+            path = match.group(1).strip()
+            if path != "/dev/null":
+                paths.add(path)
+        return paths
+
+    def _is_closing_stage(self, state: TurnState) -> bool:
+        return state.iterations >= math.ceil(
+            self.loop_guard.config.max_iterations * 0.7
+        )
+
+    @staticmethod
+    def _task_forbids_shell(state: TurnState) -> bool:
+        contract = state.task_contract
+        if contract is None:
+            return False
+        return any(
+            requirement.prohibition
+            and "shell" in requirement.text.lower()
+            for requirement in contract.requirements
         )
 
     @staticmethod

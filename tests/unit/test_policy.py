@@ -43,6 +43,25 @@ class PolicyTests(unittest.TestCase):
             PolicyOutcome.ASK,
         )
 
+    def test_shell_source_edit_fallback_is_denied(self) -> None:
+        policy = PolicyEngine(PermissionMode.SAFE_EDIT)
+        shell = RunShellTool(ShellExecutor())
+
+        decision = policy.evaluate(
+            shell,
+            {
+                "argv": [
+                    "python",
+                    "-c",
+                    "from pathlib import Path; Path('app.py').write_text('changed')",
+                ]
+            },
+            self.workspace,
+        )
+
+        self.assertEqual(decision.outcome, PolicyOutcome.DENY)
+        self.assertIn("禁止用 Shell", decision.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

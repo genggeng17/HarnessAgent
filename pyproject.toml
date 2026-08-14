@@ -8,8 +8,19 @@ version = "0.1.0"
 description = "本地、可测试、可恢复的 Coding Agent Harness"
 readme = "README.md"
 requires-python = ">=3.12"
+keywords = ["coding-agent", "agent-harness", "llm", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "httpx>=0.27,<1",
+    "keyring>=25,<26",
     "pydantic>=2.12,<3",
 ]
 
@@ -18,9 +29,15 @@ harness-agent = "harness_agent.cli.main:main"
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2,<2",
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",
+    "twine>=6,<7",
 ]
+
+[project.urls]
+Repository = "https://github.com/genggeng17/HarnessAgent"
+Documentation = "https://github.com/genggeng17/HarnessAgent#readme"
 
 [tool.setuptools.packages.find]
 include = ["harness_agent*"]
