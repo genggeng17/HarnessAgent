@@ -1,225 +1,100 @@
 # HarnessAgent
 
-HarnessAgent 是一个 Python 实现的本地 Coding Agent 运行内核。它能够让模型以结构化动作读取项目、修改文件、执行受控命令、运行验证，并把会话、审批和执行过程保存到项目目录中。
+## 项目简介
 
-项目不依赖现成 Agent 框架；主循环、工具分发、安全判断、验证门禁、记忆和恢复都由本项目实现，并支持使用 Mock LLM 完全离线测试。完整设计见 [docs/spec.md](docs/spec.md)。
+HarnessAgent 是一个使用 Python 实现的本地 Coding Agent 运行内核。它把大语言模型每轮给出的单个结构化 Action，接入工作区工具、权限治理、客观验证、会话持久化与恢复机制，使模型能够在明确边界内读取代码、修改文件、运行测试并根据失败证据继续修正。
 
-## 当前完成度
+本项目不使用 LangChain、AutoGen、CrewAI 等现成 Agent 编排框架。以下核心机制均由仓库代码实现，并可在移除真实 LLM 后通过 Mock LLM 离线验证：
 
-M1–M6 都已经有可运行的纵向实现，但尚不能认为规格中的全部验收条件都已完整满足。
+- Agent 主循环与严格 Action Schema；
+- 工具注册、参数校验、治理与统一分发；
+- 工作区边界、文件读取、搜索和多种精确修改；
+- `ALLOW / ASK / DENY` 策略、一次性审批和业务澄清；
+- 绑定工作区 revision 的测试反馈与成功门禁；
+- Session、Turn、Trace、长期记忆和中断恢复；
+- DeepSeek-V4-Pro Provider 与顺序 Mock Provider。
 
-| 里程碑 | 当前状态 | 已实现内容 |
-|---|---|---|
-| M1 | 已达到核心目标 | 严格 Action 解析、计划、Turn 状态、状态转换、循环限制和可恢复 Mock LLM |
-| M2 | 已达到核心目标 | 工作区边界、目录浏览、文件读取、文字搜索、工具注册与统一分发 |
-| M3 | 核心流程可用，仍有门禁缺口 | Patch、统一命令执行、验证结果、修改 revision、验证失败后重试和成功结束门禁 |
-| M4 | 核心流程可用，恢复策略仍可加强 | 审批暂停、拒绝与中止、一次性授权、业务澄清、执行前落盘和未知执行保护 |
-| M5 | 最小 CLI 与持久化可用 | Session/Turn 保存、对话记录、状态快照、Trace、命令日志和 `/resume` |
-| M6 | 基础能力已接入，产品化不足 | 三种权限模式、危险命令规则、项目/决定记忆、版本化配置和 DeepSeek-V4-Pro Provider |
-
-## 已有功能
-
-### 确定性的 Agent 循环
-
-模型每次只能输出一个 JSON Action。系统会严格检查类型、字段和状态，不会从格式错误的文本中猜测并执行操作。
-
-真实模型每次请求都会收到由代码生成的完整 Action JSON Schema、各 Action 最小示例和工具参数 Schema。每一轮还会临时加入当前阶段、计划、工作区 revision、验证进度、权限模式及剩余调用次数；这个动态快照不会重复写入持久对话。格式错误时，系统会返回缺失字段、禁止的外层包装和正确示例，帮助模型在下一轮精确修正。
-
-目标项目根目录存在 `AGENTS.md` 时，启动后会自动读取最多 12,000 个字符作为项目规则；不会把 `.env` 内容放入模型上下文。对于简单只读任务，模型会被明确要求跳过计划、优先使用专用文件工具，并在取得足够证据后立即结束。
-
-目前支持：
-
-- 建立和更新线性计划；
-- 调用一个受注册表管理的工具；
-- 基于已有结果进行反思；
-- 向用户询问业务信息；
-- 以成功、部分完成或失败结束当前 Turn。
-
-循环有最大迭代次数、最大工具调用次数、最大反思次数和重复动作限制，达到上限后会确定性停止。
-
-### 工作区和工具
-
-内置工具包括：
-
-- `list_directory`：浏览工作区目录；
-- `read_file`：按行读取 UTF-8 文件；
-- `search_text`：在工作区中执行字面文字搜索；
-- `apply_patch`：使用 unified diff 创建、修改或删除文件；
-- `run_shell`：使用参数数组和 `shell=False` 执行命令；
-- `run_verification`：运行配置中登记的验证器。
-
-所有工具调用都经过参数校验、权限判断和统一分发。文件工具只接受工作区相对 POSIX 路径，并拦截绝对路径、`..` 越界和符号链接逃逸。
-
-### 修改和验证
-
-文件成功修改后，Turn 会进入“工作区尚未验证”的状态。验证工具根据进程是否成功启动、是否超时以及退出码是否为 0 判断通过与否。验证失败的原始输出会交回模型，由模型决定继续修改还是结束。
-
-每个会修改文件的任务都会把以下测试约定交给模型：修改前先查看并尽量运行相关的已有测试；优先复用已有测试，缺少覆盖时再补写；修复问题或新增行为时尽量确认新测试在修复前会失败；修改后先运行相关测试，再运行全部必需验证器。不得通过删除、跳过或弱化原有测试来制造通过结果。
-
-验证器会从 Python、Node.js、Rust、Go、Maven 和 Gradle 的明确项目标记中自动发现；同一仓库可以登记多个。任务开始后才创建测试配置时，可以使用 `auto` 重新发现。如果无法识别项目的真实测试方式，才需要在 `.agent/config.json` 中手动补充。
-
-验证进度和完整证据会写入 Turn 状态。多个必需验证器可以分次运行并在暂停、恢复或进程重启后继续；每次文件修改都会产生新 revision，让旧结果自动失效。没有可用验证器、测试失败或尚未运行全部必需检查时，系统都会阻止模型以成功结果结束 Turn。
-
-### 权限和审批
-
-支持三种权限模式：
-
-- `READ_ONLY`：允许文件读取和少量只读 Git 命令，禁止文件修改和普通 Shell；
-- `SAFE_EDIT`：允许受控文件修改和已注册验证器，普通 Shell、删除和安装依赖等操作需要审批；
-- `FULL_AUTO`：当前与 `SAFE_EDIT` 的主要规则相同，仍不会绕过删除、Shell 和危险命令门禁。
-
-`git reset --hard`、`git clean -fd`、`git restore` 等已知会丢弃修改的命令会被直接拒绝。需要审批的操作会暂停并保存原工具调用；批准只对该动作和原参数生效一次。
-
-如果程序在工具已经标记为派发、但尚未记录结果时退出，恢复后会把该操作标记为“执行结果未知”，不会自动重复执行。
-
-### 会话、恢复和记录
-
-同一次 CLI 运行中可以在一个 Session 内连续提交多个任务。每个 Turn 都会保存状态快照、最终结果、事件时间线和完整命令输出。
-
-数据默认保存在目标项目的 `.agent/` 中：
-
-```text
-.agent/
-├── config.json                       # 可选项目配置
-├── memory/
-│   ├── project.json                  # 项目事实
-│   └── decisions.jsonl               # 用户确认的长期决定
-└── sessions/<session-id>/
-    ├── metadata.json
-    ├── transcript.jsonl
-    └── turns/<turn-id>/
-        ├── metadata.json
-        ├── state.json
-        ├── trace.jsonl
-        ├── commands.log
-        └── result.json
-```
-
-### 长期记忆
-
-项目事实必须包含来源文件和证据摘要；用户决定必须来自用户明确确认或项目规范。模型的临时推测不会自动写入长期记忆。
-
-当前记忆已经接入模型上下文选择，但写入事实和决定仍主要通过 Python API 完成，CLI 暂无专门的记忆管理命令。
-
-### DeepSeek-V4-Pro
-
-真实 Provider 默认使用以下配置：
-
-```text
-Base URL: https://njusehub.info/v1
-Endpoint: /chat/completions
-Model: deepseek-v4-pro
-API Key 环境变量: NEW_API_KEY
-```
-
-请求采用 OpenAI 兼容的消息格式、非流式响应和 JSON 输出。网络超时、HTTP 429 和部分 5xx 错误最多重试两次。启动时会读取目标项目根目录的 `.env`，并从环境变量中取得 API Key；`.env` 已被 Git 忽略。
+当前版本为 `0.1.0`，要求 Python 3.12 或更高版本。项目发布纯 Python `py3-none-any` wheel，可运行于 Windows、macOS 和 Linux；主要开发与真实验证环境为 Windows PowerShell。
 
 ## 安装
 
-项目要求 Python 3.12 或更高版本。
-
-Windows PowerShell：
+### 从源码安装
 
 ```powershell
+git clone https://github.com/genggeng17/HarnessAgent.git
+Set-Location HarnessAgent
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 ```
 
-只安装运行依赖：
+macOS 或 Linux 激活虚拟环境时使用：
+
+```bash
+source .venv/bin/activate
+```
+
+### 从 wheel 安装
+
+从 GitLab CI 的 `package-build` Artifact 下载 wheel 后执行：
 
 ```powershell
-python -m pip install -e .
+python -m pip install .\harness_agent-0.1.0-py3-none-any.whl
+harness-agent --help
 ```
 
-## 使用真实模型
-
-首次使用时复制环境文件模板：
+安装后可使用两个等价入口：
 
 ```powershell
-Copy-Item .env.example .env
+harness-agent --help
+python -m harness_agent --help
 ```
 
-打开 `.env`，把占位内容替换为真实密钥：
+## 运行
 
-```dotenv
-NEW_API_KEY=你的_API_Key
-```
+### 安全配置 API Key
 
-以后启动时会自动读取，不需要在每个 PowerShell 窗口中重复输入。已经通过 `$env:NEW_API_KEY` 设置的当前进程变量优先于 `.env`，可用于临时覆盖。不要提交或分享 `.env`。
+真实 Provider 的 API Key 只从操作系统钥匙串读取：Windows Credential Manager、macOS Keychain，或 Linux 已配置的 Secret Service 后端。Key 不从命令行、环境变量、`.env` 或项目配置文件读取。
 
-在当前项目中启动：
+首次真实运行时，如果终端可交互且尚未配置 Key，CLI 会以隐藏输入引导保存。也可提前管理凭据：
 
 ```powershell
-python -m harness_agent --project .
+harness-agent --project C:\path\to\target-project credentials set
+harness-agent --project C:\path\to\target-project credentials status
+harness-agent --project C:\path\to\target-project credentials update
+harness-agent --project C:\path\to\target-project credentials clear
 ```
 
-安装项目后也可以使用脚本入口：
+`status` 不回显明文。默认钥匙串服务名为 `HarnessAgent`，凭据名为 `deepseek-v4-pro`；不同项目可在 `.agent/config.json` 中使用不同的 `deepseek.credential_name`。
+
+### 真实模型模式
+
+操作当前目录：
 
 ```powershell
 harness-agent --project .
 ```
 
-进入 CLI 后：
+操作其他项目：
 
-- 直接输入文字：创建一个新 Turn；
-- `/resume`：恢复等待用户处理的 Turn；只有一个目标时直接选择，多个目标时列出 ID；
-- `/resume <session-id> <turn-id>`：恢复指定 Turn；
-- 审批回答 `yes`、`y` 或 `允许`：允许原操作；
-- 审批回答 `no`、`n` 或 `拒绝`：拒绝原操作并让模型继续；
-- 回答 `abort` 或 `停止`：中止 Turn；
-- `exit` 或 `quit`：退出 CLI。
-
-新任务如果停在审批或业务澄清状态，CLI 会显示等待原因。下一次输入 `/resume` 后，再输入审批选择或业务答案。
-
-## 项目配置
-
-`.agent/config.json` 是可选文件；不存在时使用安全默认值，并根据 Python 测试文件及 `pyproject.toml`、有效的 npm test 脚本、`Cargo.toml`、`go.mod`、`pom.xml` 或 Gradle Wrapper 尝试登记标准测试命令。配置字段严格校验，未知字段会导致启动失败。
-
-完整示例：
-
-```json
-{
-  "schema_version": 1,
-  "permission_mode": "SAFE_EDIT",
-  "validators": [
-    {
-      "id": "tests",
-      "argv": ["python", "-m", "pytest"],
-      "cwd": ".",
-      "timeout_seconds": 60,
-      "required": true
-    }
-  ],
-  "read_only_command_allowlist": [
-    "git status",
-    "git diff",
-    "git log",
-    "git show"
-  ],
-  "allow_idempotent_unknown_execution_retry": false,
-  "enable_long_term_memory": true,
-  "loop_guard": {
-    "max_iterations": 20,
-    "max_tool_calls": 40,
-    "max_reflections": 3,
-    "repeated_action_limit": 3
-  },
-  "deepseek": {
-    "base_url": "https://njusehub.info/v1",
-    "model": "deepseek-v4-pro",
-    "api_key_env": "NEW_API_KEY",
-    "timeout_seconds": 60,
-    "max_retries": 2
-  }
-}
+```powershell
+harness-agent --project C:\path\to\target-project
 ```
 
-建议在会修改文件的项目中显式配置至少一个可靠验证器。
+默认连接 `https://njusehub.info/v1/chat/completions`，模型为 `deepseek-v4-pro`。交互命令如下：
 
-## 离线 Mock 模式
+| 输入 | 行为 |
+|---|---|
+| 普通文字 | 在当前 Session 创建一个 Turn |
+| `/resume` | 恢复唯一等待任务，或列出多个候选任务 |
+| `/resume <session-id> <turn-id>` | 恢复指定 Turn |
+| `yes` / `no` | 一次性批准或拒绝待审批动作 |
+| `abort` | 中止等待中的 Turn |
+| `exit` / `quit` | 退出 CLI |
 
-Mock 模式不需要网络和 API Key。创建 `responses.json`：
+### 离线 Mock 模式
+
+创建 `responses.json`；数组中的每一项都是一次模型调用返回的 JSON 字符串：
 
 ```json
 [
@@ -227,61 +102,164 @@ Mock 模式不需要网络和 API Key。创建 `responses.json`：
 ]
 ```
 
-启动：
+然后运行：
 
 ```powershell
-python -m harness_agent --project . --mock-responses responses.json
+harness-agent --project . --mock-responses .\responses.json
 ```
 
-每次模型调用会按顺序消费数组中的一条字符串。响应耗尽时会明确报错。
+Mock 响应按顺序消费，耗尽时明确失败；该模式不访问网络，也不需要 API Key。
+
+### 项目配置与运行记录
+
+`.agent/config.json` 是可选的非敏感配置，可声明权限模式、验证器、循环预算和 Provider 参数。文件不存在时使用安全默认值，并自动发现 Python、Node.js、Rust、Go、Maven 和 Gradle 的常见测试入口。
+
+最小配置示例：
+
+```json
+{
+  "schema_version": 1,
+  "permission_mode": "SAFE_EDIT",
+  "validators": [
+    {"id": "tests", "argv": ["python", "-m", "pytest"], "cwd": ".", "required": true}
+  ]
+}
+```
+
+运行证据写入目标项目的 `.agent/`：
+
+```text
+.agent/
+├── config.json
+├── memory/
+└── sessions/<session-id>/
+    ├── transcript.jsonl
+    └── turns/<turn-id>/
+        ├── state.json
+        ├── trace.jsonl
+        ├── commands.log
+        └── result.json
+```
 
 ## 测试
 
-使用 pytest：
+安装开发依赖后，一条命令运行全部离线单元测试和集成测试：
 
 ```powershell
 python -m pytest
 ```
 
-或使用标准库 unittest：
+2026-08-14 的本地验证结果为 `71 passed, 1 skipped`。跳过项是 Windows 账户缺少创建符号链接权限时无法执行的符号链接逃逸测试。测试不访问真实 LLM、网络或系统钥匙串中的真实凭据。
+
+CI 配置位于 `.gitlab-ci.yml`，其中必需的 `unit-test` job 会在 Python 3.12 环境执行同一条测试命令。
+
+## 机制演示
+
+机制演示使用 Mock LLM 或直接构造领域对象，确定性覆盖三类专项要求：
+
+1. Policy 拦截危险命令和 Shell 修改源码旁路；
+2. 注入验证失败后，失败证据回灌并驱动下一步动作改变；
+3. 一次性审批、崩溃窗口不重放副作用和修改失败有限恢复。
+
+运行相关测试文件：
 
 ```powershell
-python -m unittest discover -s tests -p "test_*.py" -v
+python -m pytest tests/unit/test_policy.py tests/integration/test_m3_edit_verify_loop.py tests/integration/test_m4_m5_runtime.py -q
 ```
 
-测试不调用真实模型和网络。当前 Windows 账户如果没有创建符号链接的权限，符号链接逃逸测试会跳过。
+六个精确演示用例、预期状态转换和单独运行命令见 [MECHANISM_DEMO.md](MECHANISM_DEMO.md)。真实模型端到端实验保存在 `test_projects/`，不属于离线回归的必要条件。
 
-## 已知限制与审查结论
+## 分发命令
 
-以下问题意味着 M1–M6 目前属于“核心实现完成”，还不是全部验收条件都已满足：
+本项目使用 `setuptools` 构建 wheel 与源码包。执行：
 
-1. **AI 新写测试的质量仍需要判断。** 系统能证明测试实际运行、修改前后结果和当前 revision，但不能仅靠退出码证明测试内容真正理解了用户需求；现有测试和“先失败、后通过”只能降低这个风险。
-2. **自动测试发现仍以项目根目录为主。** 复杂的多层 monorepo、需要数据库或外部服务的测试，仍建议显式配置验证器。
-3. **Shell 不是沙箱。** `cwd` 被限制在工作区内，但用户批准后的命令参数仍可能主动访问工作区外路径；当前危险命令规则也不是完整的系统安全边界。
-4. **Trace 事件不完整。** 当前主要保存状态变化和工具执行事件，尚缺少完整的 Action 解析、拒绝、权限决定和验证完成事件；CLI 也没有时间线回放界面。
-5. **缺少 `changes.diff`。** 文件修改结果没有按规格汇总为每个 Turn 的变更补丁。
-6. **Mock 的重启恢复不完整。** Mock LLM 自身支持 cursor 快照，但 Session/Turn 存储尚未保存并恢复该 cursor。
-7. **长期记忆入口有限。** 已有存储和筛选能力，但没有 CLI 的查看、写入、确认和失效命令，也没有自动重新扫描事实。
-8. **真实 Provider 的端到端覆盖仍有限。** 已使用真实密钥完成“读取文件后回答”的端到端测试，但真实修改、审批、失败修复和多验证器流程仍主要依靠离线测试。
-9. **上下文会持续增长。** 当前 Session transcript 会整体回灌，尚未实现按相关性裁剪、摘要和 token 预算。
-10. **测试场景仍不齐全。** 审批中止、重复恢复、危险命令集和真实 CLI 多轮重启恢复等场景还需要专门测试。
+```powershell
+python -m pip install -e ".[dev]"
+python -m build
+python -m twine check dist/*
+```
 
-## 建议的后续优化顺序
+生成：
 
-优先级最高：
+```text
+dist/
+├── harness_agent-0.1.0-py3-none-any.whl
+└── harness_agent-0.1.0.tar.gz
+```
 
-1. 加强 Shell 参数和工作区外路径判断，明确审批不是沙箱；
-2. 补齐 AI 新增测试“修复前失败、修复后通过”的自动证据关联；
-3. 补齐 M4–M6 验收测试，特别是中止、重复恢复和真实 CLI 进程重启。
+本地安装构建产物并冒烟检查：
 
-随后可以完善：
+```powershell
+python -m pip install .\dist\harness_agent-0.1.0-py3-none-any.whl
+harness-agent --help
+```
 
-- 由统一 Event 发布入口生成完整 Trace，并在 CLI 中提供 `/trace`；
-- 生成 `changes.diff` 和面向用户的修改摘要；
-- 提供 `/sessions`、`/memory`、`/config`、`/validators` 等管理命令；
-- 持久化 Mock cursor，并改善 Session 选择和恢复体验；
-- 为真实模型提供完整 Action 协议、状态和资源限制上下文；
-- 增加上下文摘要、token 预算和相关消息选择；
-- 增加 Provider 健康检查、连接测试和更清晰的错误提示。
+GitLab CI 的分发流程为：
 
-更长期可考虑加入 Git Worktree 隔离、Subagent、并行任务和 DAG 调度，但这些属于第一阶段范围之外。
+- `unit-test`：运行完整离线测试；
+- `package-build`：构建并校验 wheel/sdist，在隔离虚拟环境安装 wheel 并检查 CLI；
+- `package-publish`：仅在 `v<主版本>.<次版本>.<修订号>` tag 上使用 GitLab 自动提供的 `CI_JOB_TOKEN` 发布到项目 PyPI Package Registry。
+
+CI 不需要或保存真实 API Key。未创建发布 tag 时，可从 `package-build` Artifact 获取安装包。
+
+## 目录结构
+
+```text
+HarnessAgent/
+├── harness_agent/
+│   ├── agent/          # Action、主循环、状态机、上下文与验证门禁
+│   ├── cli/            # CLI 组合入口
+│   ├── config/         # 版本化非敏感项目配置
+│   ├── governance/     # Policy 与权限模式
+│   ├── llm/            # LLM 抽象、Mock 与 DeepSeek Provider
+│   ├── memory/         # 项目事实与人工决定记忆
+│   ├── runtime/        # Workspace、Session 与 Turn 协调
+│   ├── storage/        # 原子状态和 JSONL 存储
+│   ├── tools/          # Registry、Dispatcher 与工具实现
+│   ├── tracing/        # 结构化 Trace 事件
+│   └── credentials.py  # 系统钥匙串凭据生命周期
+├── tests/
+│   ├── unit/           # 确定性机制单元测试
+│   └── integration/    # Mock LLM 纵向循环测试
+├── test_projects/      # 真实模型端到端实验项目
+├── docs/requirement/   # 课程通用要求与 Harness 专项要求
+├── SPEC.md             # 设计与验收契约
+├── PLAN.md             # 里程碑、TDD 步骤与实现证据
+├── SPEC_PROCESS.md     # 规约形成与关键取舍
+├── MECHANISM_DEMO.md   # 可重复运行的机制演示
+├── AGENT_LOG.md        # AI 协作过程记录
+├── .gitlab-ci.yml      # 测试、构建和 tag 发布流水线
+└── pyproject.toml      # 包元数据、依赖与 CLI 入口
+```
+
+## 安全边界说明
+
+HarnessAgent 在应用层实施以下确定性边界：
+
+- **工作区围栏**：文件工具拒绝绝对路径、`..` 和符号链接逃逸，只允许访问目标项目；
+- **命令执行**：Shell 使用参数数组和 `shell=False`，拒绝已知破坏性命令、丢弃 Git 修改以及常见 Shell 写源码方式；
+- **最小授权**：只读工具可直接运行，普通 Shell 在 `SAFE_EDIT` / `FULL_AUTO` 下仍需人工审批；批准只绑定原 Action 与参数一次；
+- **验证门禁**：发生修改后，只有当前 workspace revision 的全部必需验证器通过，Agent 才能报告成功；
+- **安全恢复**：工具派发后、结果落盘前若发生崩溃，状态转为 `EXECUTION_UNKNOWN`，未知副作用不会自动重放；
+- **凭据隔离**：真实 API Key 仅保存在系统钥匙串中，隐藏录入，状态、异常、Trace 与配置均不回显明文。
+
+这些规则是应用层治理，不是操作系统沙箱。经用户批准的程序仍可能主动访问工作区外文件、网络或外部服务；请只在可信环境和可恢复的项目副本中运行。
+
+## 已知限制
+
+- 测试通过只能证明已声明验证器成功，不能证明 AI 新增测试完整覆盖用户意图；
+- 验证器自动发现以项目根目录和常见项目标记为主，复杂 monorepo 应显式配置；
+- 上下文裁剪基于字符预算和近期消息，不是语义检索；
+- Linux 真实模式依赖可用的 Secret Service/keyring 后端；无后端的服务器仍可运行 Mock 模式；
+- wheel 与 CPU 架构无关，但目标机必须预装 Python 3.12+；
+- 当前主要交互形态为本地 CLI，仓库未提供 WebUI；
+- GitLab Package Registry 仅在语义版本 tag 的发布流水线成功后出现对应版本。
+
+## 相关文档
+
+- [SPEC.md](SPEC.md)：问题、范围、架构、机制设计与验收标准；
+- [PLAN.md](PLAN.md)：实现任务、依赖、TDD 步骤和当前证据；
+- [SPEC_PROCESS.md](SPEC_PROCESS.md)：规约形成、冷启动检查与人工取舍；
+- [MECHANISM_DEMO.md](MECHANISM_DEMO.md)：六项确定性机制演示；
+- [AGENT_LOG.md](AGENT_LOG.md)：按时间整理的 AI 协作记录；
+- [通用要求](docs/requirement/common_requirement.md)与 [Harness 专项要求](docs/requirement/AI4SE_Final_Project_A_Coding_Agent_Harness.md)。

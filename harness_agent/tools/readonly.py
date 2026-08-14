@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -126,6 +127,7 @@ class ReadFileTool:
             args.max_chars or execution_context.max_tool_output_chars,
             execution_context.max_tool_output_chars,
         )
+        truncated = len(output) > limit
         return ToolResult(
             tool_call_id=tool_call_id,
             tool_name=self.name,
@@ -133,7 +135,89 @@ class ReadFileTool:
             stdout_summary=_truncate(output, limit),
             started_at=started,
             finished_at=utc_now(),
-            data={"total_lines": len(lines), "returned_lines": len(selected)},
+            data={
+                "path": args.path,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "total_lines": len(lines),
+                "returned_lines": len(selected),
+                "start_line": args.start_line,
+                "end_line": min(end, len(lines)),
+                "complete": args.start_line == 1 and end >= len(lines) and not truncated,
+            },
+        )
+
+
+class ReadFilesArguments(_Arguments):
+    paths: tuple[str, ...] = Field(min_length=1, max_length=20)
+    max_chars_per_file: int = Field(default=6_000, ge=200, le=100_000)
+
+
+class ReadFilesTool:
+    name = "read_files"
+    description = "一次读取多个已知的 UTF-8 文本文件，适合查看相互关联的文件"
+    kind = ToolKind.READ
+    side_effect = SideEffect.NONE
+    idempotent = True
+    arguments_model = ReadFilesArguments
+
+    async def execute(
+        self,
+        arguments: BaseModel,
+        workspace: LocalWorkspace,
+        execution_context: ExecutionContext,
+        *,
+        tool_call_id: str,
+    ) -> ToolResult:
+        args = ReadFilesArguments.model_validate(arguments)
+        started = utc_now()
+        sections: list[str] = []
+        snapshots: list[dict[str, object]] = []
+        remaining = execution_context.max_tool_output_chars
+        seen: set[str] = set()
+        for relative_path in args.paths:
+            if relative_path in seen:
+                continue
+            seen.add(relative_path)
+            path = workspace.resolve_path(relative_path)
+            if not path.is_file():
+                raise ValueError(f"不是文件：{relative_path}")
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"文件不是 UTF-8 文本：{relative_path}") from exc
+            numbered = "\n".join(
+                f"{number}: {line}"
+                for number, line in enumerate(text.splitlines(), start=1)
+            )
+            header = f"===== {relative_path} =====\n"
+            if remaining <= len(header):
+                break
+            allowance = min(args.max_chars_per_file, remaining - len(header))
+            marker = "\n… 文件内容已截断"
+            visible_limit = allowance
+            if len(numbered) > allowance:
+                visible_limit = max(allowance - len(marker), 0)
+            visible = numbered[:visible_limit]
+            complete = len(visible) == len(numbered)
+            section = header + visible + (marker if not complete else "")
+            sections.append(section)
+            snapshots.append(
+                {
+                    "path": relative_path,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "total_lines": len(text.splitlines()),
+                    "complete": complete,
+                }
+            )
+            remaining -= len(section)
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name=self.name,
+            status=ToolResultStatus.SUCCEEDED,
+            stdout_summary="\n\n".join(sections),
+            started_at=started,
+            finished_at=utc_now(),
+            data={"files": snapshots},
         )
 
 
@@ -194,7 +278,9 @@ class SearchTextTool:
         )
 
 
-def readonly_tools() -> tuple[ListDirectoryTool, ReadFileTool, SearchTextTool]:
+def readonly_tools() -> tuple[
+    ListDirectoryTool, ReadFileTool, SearchTextTool, ReadFilesTool
+]:
     """返回 M2 的完整只读工具切片。"""
 
-    return ListDirectoryTool(), ReadFileTool(), SearchTextTool()
+    return ListDirectoryTool(), ReadFileTool(), SearchTextTool(), ReadFilesTool()

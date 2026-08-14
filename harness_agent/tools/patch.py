@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,11 +27,41 @@ class ApplyPatchArguments(BaseModel):
     patch: str = Field(min_length=1, max_length=5_000_000)
 
 
+class ExactEditArguments(BaseModel):
+    """以唯一原文为锚点进行稳定的局部修改。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    mode: Literal["replace", "insert_before", "insert_after"] = "replace"
+    target: str = Field(min_length=1, max_length=1_000_000)
+    content: str = Field(max_length=1_000_000)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class BatchExactEditArguments(BaseModel):
+    """一次提交一组相互关联的精确修改。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    edits: tuple[ExactEditArguments, ...] = Field(min_length=1, max_length=20)
+
+
 @dataclass(frozen=True, slots=True)
 class _FilePatch:
     old_path: str | None
     new_path: str | None
     hunks: tuple[tuple[int, tuple[str, ...]], ...]
+
+
+class PatchContextError(ValueError):
+    """Patch 与当前文件内容不一致，并携带可恢复位置。"""
+
+    def __init__(self, kind: str, path: str, line: int, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+        self.line = line
 
 
 class ApplyPatchTool:
@@ -71,7 +103,19 @@ class ApplyPatchTool:
                 if not path.is_file():
                     raise ValueError(f"Patch 目标不是文件：{relative}")
                 old_text = path.read_text(encoding="utf-8")
-            new_text = self._apply_hunks(old_text, file_patch.hunks, relative)
+            try:
+                new_text = self._apply_hunks(old_text, file_patch.hunks, relative)
+            except PatchContextError as exc:
+                return _edit_failure_result(
+                    tool_call_id=tool_call_id,
+                    tool_name=self.name,
+                    started=started,
+                    path=path,
+                    relative=relative,
+                    kind=exc.kind,
+                    line=exc.line,
+                    message=str(exc),
+                )
             prepared.append((path, None if file_patch.new_path is None else new_text, relative))
 
         for path, new_text, relative in prepared:
@@ -89,6 +133,13 @@ class ApplyPatchTool:
             started_at=started,
             finished_at=utc_now(),
             modified_paths=tuple(modified_paths),
+            data={
+                "file_sha256": {
+                    relative: _sha256_path(path)
+                    for path, new_text, relative in prepared
+                    if new_text is not None
+                }
+            },
         )
 
     def _parse(self, patch: str) -> tuple[_FilePatch, ...]:
@@ -155,7 +206,12 @@ class ApplyPatchTool:
         for old_start, body in hunks:
             target = max(old_start - 1, 0)
             if target < cursor or target > len(old_lines):
-                raise ValueError(f"Patch hunk 行号越界：{relative}:{old_start}")
+                raise PatchContextError(
+                    "hunk_out_of_range",
+                    relative,
+                    old_start,
+                    f"Patch hunk 行号越界：{relative}:{old_start}",
+                )
             output.extend(old_lines[cursor:target])
             cursor = target
             for line in body:
@@ -165,8 +221,11 @@ class ApplyPatchTool:
                     continue
                 if cursor >= len(old_lines) or old_lines[cursor] != content:
                     actual = old_lines[cursor] if cursor < len(old_lines) else "<EOF>"
-                    raise ValueError(
-                        f"Patch 上下文不匹配：{relative}:{cursor + 1}，实际为 {actual!r}"
+                    raise PatchContextError(
+                        "context_mismatch",
+                        relative,
+                        cursor + 1,
+                        f"Patch 上下文不匹配：{relative}:{cursor + 1}，实际为 {actual!r}",
                     )
                 if marker == " ":
                     output.append(content)
@@ -176,3 +235,205 @@ class ApplyPatchTool:
         if output:
             new_text += "\n"
         return new_text
+
+
+class ExactEditTool:
+    """使用唯一原文锚点修改文件，不依赖易漂移的行号。"""
+
+    name = "edit_file"
+    description = (
+        "按唯一原文稳定修改一个 UTF-8 文件；支持替换、在原文前插入、在原文后插入。"
+        "读取文件后优先携带 expected_sha256，文件变化时会安全拒绝并返回最新摘要"
+    )
+    kind = ToolKind.WRITE
+    side_effect = SideEffect.WORKSPACE
+    idempotent = False
+    arguments_model = ExactEditArguments
+
+    async def execute(
+        self,
+        arguments: BaseModel,
+        workspace: LocalWorkspace,
+        execution_context: ExecutionContext,
+        *,
+        tool_call_id: str,
+    ) -> ToolResult:
+        del execution_context
+        args = ExactEditArguments.model_validate(arguments)
+        if workspace.read_only:
+            raise ValueError("只读工作区禁止修改文件")
+        started = utc_now()
+        path = workspace.resolve_path(args.path)
+        if not path.is_file():
+            raise ValueError(f"修改目标不是文件：{args.path}")
+        text = path.read_text(encoding="utf-8")
+        digest = _sha256_path(path)
+        if args.expected_sha256 is not None and args.expected_sha256 != digest:
+            return _edit_failure_result(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                started=started,
+                path=path,
+                relative=args.path,
+                kind="stale_file",
+                line=1,
+                message="文件在读取后已经变化，请使用返回的最新版本重新修改",
+            )
+        count = text.count(args.target)
+        if count != 1:
+            return _edit_failure_result(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                started=started,
+                path=path,
+                relative=args.path,
+                kind="target_not_unique" if count > 1 else "target_not_found",
+                line=1,
+                message=f"目标原文应唯一出现一次，实际出现 {count} 次",
+            )
+        replacement = args.content
+        if args.mode == "insert_before":
+            replacement = args.content + args.target
+        elif args.mode == "insert_after":
+            replacement = args.target + args.content
+        updated = text.replace(args.target, replacement, 1)
+        path.write_text(updated, encoding="utf-8")
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name=self.name,
+            status=ToolResultStatus.SUCCEEDED,
+            stdout_summary=f"已稳定修改文件：{args.path}",
+            started_at=started,
+            finished_at=utc_now(),
+            modified_paths=(args.path,),
+            data={"file_sha256": {args.path: _sha256_path(path)}},
+        )
+
+
+class BatchExactEditTool:
+    """先在内存中检查全部修改，全部可行时再一次写入。"""
+
+    name = "edit_files"
+    description = (
+        "一次原子修改多个相关文件；每项规则与 edit_file 相同。"
+        "已读取多个相关文件并准备成组实现代码、测试和文档时优先使用"
+    )
+    kind = ToolKind.WRITE
+    side_effect = SideEffect.WORKSPACE
+    idempotent = False
+    arguments_model = BatchExactEditArguments
+
+    async def execute(
+        self,
+        arguments: BaseModel,
+        workspace: LocalWorkspace,
+        execution_context: ExecutionContext,
+        *,
+        tool_call_id: str,
+    ) -> ToolResult:
+        del execution_context
+        args = BatchExactEditArguments.model_validate(arguments)
+        if workspace.read_only:
+            raise ValueError("只读工作区禁止修改文件")
+        started = utc_now()
+        prepared: dict[Path, str] = {}
+        originals: dict[Path, str] = {}
+        relative_paths: dict[Path, str] = {}
+        for edit in args.edits:
+            path = workspace.resolve_path(edit.path)
+            if not path.is_file():
+                raise ValueError(f"修改目标不是文件：{edit.path}")
+            if path not in prepared:
+                prepared[path] = path.read_text(encoding="utf-8")
+                originals[path] = _sha256_path(path)
+                relative_paths[path] = edit.path
+            if edit.expected_sha256 is not None and edit.expected_sha256 != originals[path]:
+                return _edit_failure_result(
+                    tool_call_id=tool_call_id,
+                    tool_name=self.name,
+                    started=started,
+                    path=path,
+                    relative=edit.path,
+                    kind="stale_file",
+                    line=1,
+                    message="文件在读取后已经变化，请使用返回的最新版本重新修改",
+                )
+            current = prepared[path]
+            count = current.count(edit.target)
+            if count != 1:
+                return _edit_failure_result(
+                    tool_call_id=tool_call_id,
+                    tool_name=self.name,
+                    started=started,
+                    path=path,
+                    relative=edit.path,
+                    kind="target_not_unique" if count > 1 else "target_not_found",
+                    line=1,
+                    message=f"目标原文应唯一出现一次，实际出现 {count} 次",
+                )
+            replacement = edit.content
+            if edit.mode == "insert_before":
+                replacement = edit.content + edit.target
+            elif edit.mode == "insert_after":
+                replacement = edit.target + edit.content
+            prepared[path] = current.replace(edit.target, replacement, 1)
+
+        for path, updated in prepared.items():
+            path.write_text(updated, encoding="utf-8")
+        modified_paths = tuple(relative_paths[path] for path in prepared)
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name=self.name,
+            status=ToolResultStatus.SUCCEEDED,
+            stdout_summary=f"已原子修改 {len(modified_paths)} 个文件",
+            started_at=started,
+            finished_at=utc_now(),
+            modified_paths=modified_paths,
+            data={
+                "file_sha256": {
+                    relative_paths[path]: _sha256_path(path) for path in prepared
+                }
+            },
+        )
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _edit_failure_result(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    started,  # type: ignore[no-untyped-def]
+    path: Path,
+    relative: str,
+    kind: str,
+    line: int,
+    message: str,
+) -> ToolResult:
+    """返回当前文件版本和局部内容，供下一轮直接精准恢复。"""
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = max(line - 4, 1)
+    end = min(line + 4, len(lines))
+    excerpt = "\n".join(
+        f"{number}: {lines[number - 1]}" for number in range(start, end + 1)
+    )
+    return ToolResult(
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        status=ToolResultStatus.INVALID_ARGUMENTS,
+        error=message,
+        started_at=started,
+        finished_at=utc_now(),
+        data={
+            "edit_failure": {
+                "path": relative,
+                "kind": kind,
+                "line": line,
+                "latest_sha256": _sha256_path(path),
+                "latest_excerpt": excerpt,
+            }
+        },
+    )

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Literal
@@ -17,57 +15,6 @@ from harness_agent.storage.local import _write_json_atomically
 from harness_agent.tools.verification_tool import ValidatorConfig
 
 
-_ENV_KEY_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-
-
-def load_project_env(project_root: Path) -> tuple[str, ...]:
-    """读取项目根目录的 `.env`，且不覆盖当前进程已有的环境变量。"""
-
-    path = project_root / ".env"
-    if not path.is_file():
-        return ()
-
-    loaded: list[str] = []
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        if "=" not in line:
-            raise ValueError(f"{path} 第 {line_number} 行缺少等号")
-
-        key, value = (part.strip() for part in line.split("=", 1))
-        if not _ENV_KEY_PATTERN.fullmatch(key):
-            raise ValueError(f"{path} 第 {line_number} 行的变量名无效")
-        value = _parse_env_value(path, line_number, value)
-        if key not in os.environ:
-            os.environ[key] = value
-            loaded.append(key)
-    return tuple(loaded)
-
-
-def _parse_env_value(path: Path, line_number: int, value: str) -> str:
-    """解析 `.env` 中常用的裸值、单引号值和双引号值。"""
-
-    if not value or value[0] not in {'"', "'"}:
-        return value
-    quote = value[0]
-    if len(value) < 2 or value[-1] != quote:
-        raise ValueError(f"{path} 第 {line_number} 行的引号没有闭合")
-    inner = value[1:-1]
-    if quote == "'":
-        return inner
-    return (
-        inner.replace(r"\\", "\0")
-        .replace(r"\n", "\n")
-        .replace(r"\r", "\r")
-        .replace(r"\t", "\t")
-        .replace(r'\"', '"')
-        .replace("\0", "\\")
-    )
-
-
 class DeepSeekConfig(BaseModel):
     """DeepSeek OpenAI 兼容接口的非敏感配置。"""
 
@@ -75,7 +22,7 @@ class DeepSeekConfig(BaseModel):
 
     base_url: str = "https://njusehub.info/v1"
     model: Literal["deepseek-v4-pro"] = "deepseek-v4-pro"
-    api_key_env: str = "NEW_API_KEY"
+    credential_name: str = "deepseek-v4-pro"
     timeout_seconds: float = Field(default=60, gt=0, le=600)
     max_retries: int = Field(default=2, ge=0, le=5)
 
@@ -99,12 +46,6 @@ class ProjectConfig(BaseModel):
     loop_guard: LoopGuardConfig = Field(default_factory=LoopGuardConfig)
     deepseek: DeepSeekConfig = Field(default_factory=DeepSeekConfig)
 
-    def api_key(self) -> str | None:
-        """只从环境变量读取真实模型密钥。"""
-
-        return os.environ.get(self.deepseek.api_key_env)
-
-
 def config_path(project_root: Path) -> Path:
     """返回项目配置的固定位置。"""
 
@@ -112,9 +53,8 @@ def config_path(project_root: Path) -> Path:
 
 
 def load_project_config(project_root: Path) -> ProjectConfig:
-    """先读取本地环境文件，再读取配置；没有配置文件时使用安全默认值。"""
+    """读取非敏感项目配置；没有配置文件时使用安全默认值。"""
 
-    load_project_env(project_root)
     path = config_path(project_root)
     if not path.exists():
         return ProjectConfig(validators=detect_validators(project_root))

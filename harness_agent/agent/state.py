@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from harness_agent.agent.actions import FinalOutcome, PlanItemStatus
+from harness_agent.agent.context import EditRecovery, FileSnapshot, TaskContract
 from harness_agent.agent.interactions import ApprovalGrant, PendingInteraction, ToolExecution
 from harness_agent.agent.verification import VerificationResult
 
@@ -51,6 +52,10 @@ class TurnState(BaseModel):
     phase: TurnPhase = TurnPhase.CREATED
     suspended_phase: TurnPhase | None = None
     plan: tuple[PlanItem, ...] = ()
+    task_contract: TaskContract | None = None
+    file_snapshots: tuple[FileSnapshot, ...] = ()
+    edit_recovery: EditRecovery | None = None
+    plan_updates: int = Field(default=0, ge=0)
     workspace_dirty: bool = False
     workspace_revision: int = Field(default=0, ge=0)
     modified_paths: tuple[str, ...] = ()

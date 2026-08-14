@@ -7,6 +7,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+# 程序不读取 .env；继续忽略以防误建的明文凭据进入 Git。
 .env
 .env.*
 !.env.example

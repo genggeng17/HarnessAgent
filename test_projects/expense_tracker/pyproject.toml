@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "expense-tracker-fixture"
+version = "0.1.0"
+description = "用于 HarnessAgent 真实代码增改测试的本地记账项目"
+requires-python = ">=3.12"
+
+[project.scripts]
+expense-tracker = "expense_tracker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
