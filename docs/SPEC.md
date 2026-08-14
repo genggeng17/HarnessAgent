@@ -223,7 +223,7 @@ CLI 支持在一个 Session 中连续创建 Turn，并通过 `/resume` 恢复等
 
 DeepSeek API Key 只存入操作系统钥匙串，服务名为 `HarnessAgent`，默认凭据名称为 `deepseek-v4-pro`，也可在非敏感项目配置中改用其他凭据名称。CLI 提供隐藏录入、更新、仅状态查看和清除命令；状态与错误信息不得包含 Key 明文。运行时不读取 `.env`、进程环境变量、命令行参数或项目配置中的明文 Key。
 
-项目以 Python 3.12+ 的纯 Python wheel 和源码包分发。GitLab CI 的 `unit-test` job 运行离线测试，`package-build` 生成并校验 wheel/sdist、执行隔离安装冒烟测试，语义版本 tag 触发 `package-publish` 将产物发布到项目 PyPI Package Registry。构建、Mock 测试和发布过程不需要真实 LLM Key。
+项目以 Python 3.12+ 的纯 Python wheel 和源码包分发。GitHub Actions 的 `unit-test` job 运行离线测试，`package-build` 生成并校验 wheel/sdist、执行隔离安装冒烟测试，语义版本 tag 触发 `release` 创建 GitHub Release 并上传产物。构建、Mock 测试和发布过程不需要真实 LLM Key。
 
 ## 5. 非功能性需求
 
@@ -367,7 +367,7 @@ Coding 场景需要读取、搜索、精确修改、Patch、Shell 和验证。�
 
 ## 10. 获取、配置与运行
 
-项目以 Python wheel 与源码包分发。用户可安装 GitLab CI Artifact 中的 wheel；开发者可通过 Git 获取后进行可编辑安装：
+项目以 Python wheel 与源码包分发。用户可安装 GitHub Release 或 Actions Artifact 中的 wheel；开发者可通过 Git 获取后进行可编辑安装：
 
 ```powershell
 git clone https://github.com/genggeng17/HarnessAgent.git
@@ -394,7 +394,7 @@ python -m pip install -e ".[dev]"
 11. 真实 Provider 可以完成受控只读和跨文件修改实验；
 12. README、PLAN、SPEC_PROCESS、AGENT_LOG 和机制演示说明能够从仓库直接访问。
 13. 凭据可以在系统钥匙串中新增、更新、查看状态和清除，所有状态输出不回显明文；
-14. `python -m build` 生成通过 `twine check` 的 wheel/sdist，GitLab CI 包含 `unit-test` 与包构建任务。
+14. `python -m build` 生成通过 `twine check` 的 wheel/sdist，GitHub Actions 包含 `unit-test`、包构建和 tag Release 任务。
 
 ## 12. 里程碑
 

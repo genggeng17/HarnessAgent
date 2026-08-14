@@ -46,3 +46,6 @@ include = ["harness_agent*"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+markers = [
+    "mechanism_demo: 治理、反馈闭环与可恢复执行的确定性机制演示",
+]

@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from harness_agent.agent.action_parser import ActionParser
 from harness_agent.agent.interactions import ToolCallSnapshot
 from harness_agent.agent.loop import AgentLoop
@@ -56,6 +58,7 @@ class M4M5RuntimeTests(unittest.IsolatedAsyncioTestCase):
             arguments={"argv": [sys.executable, "-c", "print('ok')"]},
         )
 
+    @pytest.mark.mechanism_demo
     async def test_approval_pauses_then_runs_exact_original_tool_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             loop = self.make_shell_loop(
@@ -121,6 +124,7 @@ class M4M5RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.state.phase, TurnPhase.COMPLETED)
             self.assertEqual(result.state.final_message, "已收到答案")
 
+    @pytest.mark.mechanism_demo
     async def test_crash_window_becomes_unknown_instead_of_replaying(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -15,6 +15,7 @@
 | `46caf96` | 初始化仓库 |
 | `81efe83` | M0–M3：规格、核心循环、工具和验证闭环 |
 | `1f28306` | M4–M6：审批恢复、CLI、持久化、记忆和真实 Provider |
+| `2cb5074` | 长任务一致性与恢复、系统钥匙串、包分发、CI 和真实项目验收 |
 
 ## 2. 依赖关系
 
@@ -38,7 +39,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 - 状态：完成（`81efe83`）
 - 目标：定义 Project、Workspace、Session、Turn、Action、ToolResult 和 VerificationResult。
-- 文件：`SPEC.md`，原始规格可从 commit `81efe83` 追溯。
+- 文件：`docs/SPEC.md`，原始规格可从 commit `81efe83` 追溯。
 - 实现要点：区分模型决策与 Harness 的确定性执行责任；明确第一阶段不实现并行编排。
 - 验证：从规格出发能够解释一次普通 Turn、修改验证和审批恢复流程。
 - 依赖：无。
@@ -76,7 +77,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T05：实现只读工具、Registry 与 Dispatcher
 
-- 状态：完成；多文件读取增强为“完成，待提交”。
+- 状态：完成（基础实现 `81efe83`；多文件读取增强 `2cb5074`）。
 - 目标：所有工具共享注册、Schema 生成、参数校验和分发路径。
 - 文件：`harness_agent/tools/registry.py`、`dispatcher.py`、`readonly.py`。
 - TDD：先测试未知工具、非法参数、目录、读取和搜索，再实现工具；为 `read_files` 增加多文件与截断测试。
@@ -85,7 +86,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T06：实现 Policy 治理
 
-- 状态：完成；Shell 写源码旁路拒绝为“完成，待提交”。
+- 状态：完成（基础实现 `81efe83`；Shell 写源码旁路拒绝 `2cb5074`）。
 - 目标：实现 ALLOW/ASK/DENY，并确保模型不能覆盖工具可信元数据。
 - 文件：`harness_agent/governance/policy.py`、`tests/unit/test_policy.py`。
 - TDD：先写只读、删除、普通 Shell、破坏性 Git 和脚本写源码的决策测试。
@@ -94,7 +95,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T07：实现修改工具
 
-- 状态：Patch 完成（`81efe83`）；精确单/多文件修改为“完成，待提交”。
+- 状态：完成（Patch `81efe83`；精确单/多文件修改 `2cb5074`）。
 - 目标：支持 unified diff、唯一锚点、SHA-256 乐观并发和成组修改。
 - 文件：`harness_agent/tools/patch.py`、`tests/unit/test_patch_and_verification.py`。
 - TDD：先覆盖上下文不匹配、陈旧文件、锚点缺失/重复和成组预检查失败，再实现写入。
@@ -112,7 +113,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T09：接通 revision 验证闭环
 
-- 状态：完成（`81efe83`），基线和中途验证增强为“完成，待提交”。
+- 状态：完成（基础闭环 `81efe83`；基线和中途验证增强 `2cb5074`）。
 - 目标：写入后旧验证失效，全部必需验证器通过前禁止成功。
 - 文件：`harness_agent/agent/loop.py`、`state.py`、`state_machine.py`、`tests/integration/test_m3_edit_verify_loop.py`。
 - TDD：先写“写入后直接 Final 应失败”“首次失败后再次修改并通过”“持续失败耗尽预算”。
@@ -178,7 +179,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T16：加入任务卡、上下文裁剪和文件版本
 
-- 状态：完成，待提交。
+- 状态：完成（`2cb5074`）。
 - 目标：减少真实多文件任务的需求漂移和无效调用。
 - 文件：`harness_agent/agent/context.py`、`loop.py`、`state.py`、`state_machine.py`、`tools/readonly.py`。
 - TDD：先测试原始要求固定、禁止项识别、近期消息裁剪、SHA-256 快照和计划更新限制。
@@ -187,7 +188,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T17：加入修改失败有限恢复
 
-- 状态：完成，待提交。
+- 状态：完成（`2cb5074`）。
 - 目标：Patch/锚点失败后提供最新证据，限制重试并禁止 Shell 兜底。
 - 文件：`harness_agent/tools/patch.py`、`agent/loop.py`、`governance/policy.py`。
 - TDD：先写第二次失败要求完整重读、第三次失败终止、Shell 写源码拒绝测试。
@@ -198,20 +199,21 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 
 ### T18：真实项目独立验收与文档交付
 
-- 状态：完成，待整理提交。
+- 状态：完成（`2cb5074`）。
 - 目标：用记账和库存项目验证跨文件实现、CLI、持久化和隐藏验收，并形成课程交付文档。
-- 文件：`test_projects/`、`README.md`、`SPEC.md`、`PLAN.md`、`SPEC_PROCESS.md`、`AGENT_LOG.md`、`MECHANISM_DEMO.md`。
+- 文件：`test_projects/`、`README.md`、`docs/SPEC.md`、`docs/PLAN.md`、`docs/SPEC_PROCESS.md`、`docs/AGENT_LOG.md`、`docs/MECHANISM_DEMO.md`、`docs/REFLECTION.md`。
 - 验证：
   - `python -m pytest`
+  - `python -m pytest -m mechanism_demo`
   - `python -m pytest test_projects/inventory_reservation_valid_run/acceptance_tests -q`
   - 检查 Markdown 内部链接和 Git diff。
 - 依赖：T13、T17。
 
 ### T19：系统钥匙串、包分发与 CI
 
-- 状态：完成，待提交。
+- 状态：完成（系统钥匙串与包基础为 `2cb5074`；GitHub Actions 迁移完成，待提交）。
 - 目标：让新机器可通过 wheel 安装 CLI，并只通过系统钥匙串安全录入、更新、查看和清除真实 Provider Key。
-- 文件：`harness_agent/credentials.py`、`harness_agent/cli/main.py`、`pyproject.toml`、`.gitlab-ci.yml`、`tests/unit/test_credentials.py`、`README.md`。
+- 文件：`harness_agent/credentials.py`、`harness_agent/cli/main.py`、`pyproject.toml`、`.github/workflows/ci.yml`、`tests/unit/test_credentials.py`、`README.md`。
 - TDD：先使用内存钥匙串写凭据生命周期、环境变量不得覆盖钥匙串和 CLI 不回显明文的失败测试，再实现系统 keyring 适配与首次运行引导。
 - 验证：
   - `python -m pytest tests/unit/test_credentials.py`
@@ -221,6 +223,7 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
   - 在隔离虚拟环境安装 wheel并运行 `harness-agent --help`。
 - 依赖：T13、T14、T18。
 - 补充证据：旧 `.env` 中唯一的 `NEW_API_KEY` 已无回显迁移到 Windows Credential Manager 并完成等值回读，随后删除 `.env` 与 `.env.example`；完整回归与更新后的 wheel 隔离安装均确认只使用系统钥匙串。
+- 发布流程：普通 push/PR 依次运行 `unit-test` 与 `package-build`；语义版本 tag 在前两项成功后创建 GitHub Release 并上传 wheel/sdist。
 
 ## 4. 当前验证结果
 
@@ -229,3 +232,5 @@ T04/T06/T08、T12/T14 在接口冻结后可分别在独立 worktree 中并行；
 ```text
 71 passed, 1 skipped
 ```
+
+最新纵向功能提交：`2cb5074`。该提交已推送到 `origin/codex/secure-agent-runtime`，对应 T05、T06、T07、T09 和 T16–T19 的基础增强或交付证据；GitHub Actions 迁移尚待形成新提交。

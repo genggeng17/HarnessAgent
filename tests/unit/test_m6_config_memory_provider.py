@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from harness_agent.config.models import ProjectConfig, load_project_config
 from harness_agent.governance.policy import PermissionMode, PolicyEngine, PolicyOutcome
@@ -106,6 +107,7 @@ class M6ConfigMemoryProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(response.content, "{}")
 
+    @pytest.mark.mechanism_demo
     async def test_policy_distinguishes_read_only_and_dangerous_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = LocalWorkspace("test", Path(directory))

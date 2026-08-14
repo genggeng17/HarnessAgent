@@ -1,0 +1,90 @@
+name: CI and Release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  unit-test:
+    name: unit-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: 配置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 安装开发依赖
+        run: python -m pip install -e ".[dev]"
+      - name: 运行离线测试
+        run: python -m pytest
+
+  package-build:
+    name: package-build
+    needs: unit-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: 配置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 安装构建工具
+        run: python -m pip install build twine
+      - name: 构建并校验分发包
+        run: |
+          python -m build
+          python -m twine check dist/*
+      - name: 隔离安装 wheel 并检查 CLI
+        run: |
+          python -m venv .package-smoke
+          .package-smoke/bin/python -m pip install dist/*.whl
+          .package-smoke/bin/harness-agent --help
+          .package-smoke/bin/harness-agent credentials --help
+      - name: 保存分发产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: harness-agent-${{ github.run_id }}
+          path: dist/
+          retention-days: 30
+
+  release:
+    name: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 校验语义版本 tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "发布 tag 必须符合 v主版本.次版本.修订号"
+            exit 1
+          fi
+      - name: 下载分发产物
+        uses: actions/download-artifact@v6
+        with:
+          name: harness-agent-${{ github.run_id }}
+          path: dist/
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

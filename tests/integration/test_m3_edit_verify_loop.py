@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from harness_agent.agent.action_parser import ActionParser
 from harness_agent.agent.loop import AgentLoop
 from harness_agent.agent.loop_guard import LoopGuard, LoopGuardConfig
@@ -189,6 +191,7 @@ class M3EditVerifyLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.state.workspace_dirty)
             self.assertFalse(result.state.verification_history[-1].passed)
 
+    @pytest.mark.mechanism_demo
     async def test_first_verification_fails_then_second_write_passes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -292,6 +295,7 @@ class M3EditVerifyLoopTests(unittest.IsolatedAsyncioTestCase):
                 any("必须完整读取" in message.content for message in result.messages)
             )
 
+    @pytest.mark.mechanism_demo
     async def test_third_patch_failure_stops_without_shell_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

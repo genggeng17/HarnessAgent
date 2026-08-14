@@ -103,14 +103,7 @@ python -m pytest tests/integration/test_m3_edit_verify_loop.py::M3EditVerifyLoop
 ## 5. 一键运行全部机制演示
 
 ```powershell
-python -m pytest `
-  tests/unit/test_m6_config_memory_provider.py::M6ConfigMemoryProviderTests::test_policy_distinguishes_read_only_and_dangerous_shell `
-  tests/unit/test_policy.py::PolicyTests::test_shell_source_edit_fallback_is_denied `
-  tests/integration/test_m3_edit_verify_loop.py::M3EditVerifyLoopTests::test_first_verification_fails_then_second_write_passes `
-  tests/integration/test_m4_m5_runtime.py::M4M5RuntimeTests::test_approval_pauses_then_runs_exact_original_tool_once `
-  tests/integration/test_m4_m5_runtime.py::M4M5RuntimeTests::test_crash_window_becomes_unknown_instead_of_replaying `
-  tests/integration/test_m3_edit_verify_loop.py::M3EditVerifyLoopTests::test_third_patch_failure_stops_without_shell_fallback `
-  -q
+python -m pytest -m mechanism_demo
 ```
 
 预期结果：

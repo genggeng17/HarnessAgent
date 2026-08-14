@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from harness_agent.governance.policy import PermissionMode, PolicyEngine, PolicyOutcome
 from harness_agent.runtime.workspace import LocalWorkspace
 from harness_agent.tools.patch import ApplyPatchTool
@@ -43,6 +45,7 @@ class PolicyTests(unittest.TestCase):
             PolicyOutcome.ASK,
         )
 
+    @pytest.mark.mechanism_demo
     def test_shell_source_edit_fallback_is_denied(self) -> None:
         policy = PolicyEngine(PermissionMode.SAFE_EDIT)
         shell = RunShellTool(ShellExecutor())

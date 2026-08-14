@@ -18,7 +18,18 @@ HarnessAgent 是一个使用 Python 实现的本地 Coding Agent 运行内核。
 
 ## 安装
 
-### 从源码安装
+### 普通用户：两步启动
+
+版本发布后，可直接从 GitHub Release 安装 wheel 并运行：
+
+```powershell
+python -m pip install https://github.com/genggeng17/HarnessAgent/releases/download/v0.1.0/harness_agent-0.1.0-py3-none-any.whl
+harness-agent --project C:\path\to\target-project
+```
+
+首次运行会以隐藏输入录入 API Key 并保存到系统钥匙串，无需预先执行凭据命令。正式 Release 创建前，可从 GitHub Actions 的 `package-build` Artifact 下载 wheel 后使用本地路径安装。
+
+### 开发者：从源码安装
 
 ```powershell
 git clone https://github.com/genggeng17/HarnessAgent.git
@@ -34,21 +45,7 @@ macOS 或 Linux 激活虚拟环境时使用：
 source .venv/bin/activate
 ```
 
-### 从 wheel 安装
-
-从 GitLab CI 的 `package-build` Artifact 下载 wheel 后执行：
-
-```powershell
-python -m pip install .\harness_agent-0.1.0-py3-none-any.whl
-harness-agent --help
-```
-
-安装后可使用两个等价入口：
-
-```powershell
-harness-agent --help
-python -m harness_agent --help
-```
+开发安装使用额外的测试和构建依赖；普通用户不需要执行这些命令。`harness-agent` 与 `python -m harness_agent` 是等价入口。
 
 ## 运行
 
@@ -56,16 +53,13 @@ python -m harness_agent --help
 
 真实 Provider 的 API Key 只从操作系统钥匙串读取：Windows Credential Manager、macOS Keychain，或 Linux 已配置的 Secret Service 后端。Key 不从命令行、环境变量、`.env` 或项目配置文件读取。
 
-首次真实运行时，如果终端可交互且尚未配置 Key，CLI 会以隐藏输入引导保存。也可提前管理凭据：
+首次真实运行时，如果终端可交互且尚未配置 Key，CLI 会以隐藏输入引导保存。凭据管理统一使用以下命令形式：
 
 ```powershell
 harness-agent --project C:\path\to\target-project credentials set
-harness-agent --project C:\path\to\target-project credentials status
-harness-agent --project C:\path\to\target-project credentials update
-harness-agent --project C:\path\to\target-project credentials clear
 ```
 
-`status` 不回显明文。默认钥匙串服务名为 `HarnessAgent`，凭据名为 `deepseek-v4-pro`；不同项目可在 `.agent/config.json` 中使用不同的 `deepseek.credential_name`。
+将 `set` 替换为 `status`、`update` 或 `clear` 可执行对应操作；`status` 不回显明文。默认钥匙串服务名为 `HarnessAgent`，凭据名为 `deepseek-v4-pro`；不同项目可在 `.agent/config.json` 中使用不同的 `deepseek.credential_name`。
 
 ### 真实模型模式
 
@@ -151,7 +145,7 @@ python -m pytest
 
 2026-08-14 的本地验证结果为 `71 passed, 1 skipped`。跳过项是 Windows 账户缺少创建符号链接权限时无法执行的符号链接逃逸测试。测试不访问真实 LLM、网络或系统钥匙串中的真实凭据。
 
-CI 配置位于 `.gitlab-ci.yml`，其中必需的 `unit-test` job 会在 Python 3.12 环境执行同一条测试命令。
+CI 配置位于 `.github/workflows/ci.yml`，其中 `unit-test` job 会在 Python 3.12 环境执行同一条测试命令。
 
 ## 机制演示
 
@@ -161,17 +155,17 @@ CI 配置位于 `.gitlab-ci.yml`，其中必需的 `unit-test` job 会在 Python
 2. 注入验证失败后，失败证据回灌并驱动下一步动作改变；
 3. 一次性审批、崩溃窗口不重放副作用和修改失败有限恢复。
 
-运行相关测试文件：
+一键运行六项机制演示：
 
 ```powershell
-python -m pytest tests/unit/test_policy.py tests/integration/test_m3_edit_verify_loop.py tests/integration/test_m4_m5_runtime.py -q
+python -m pytest -m mechanism_demo
 ```
 
-六个精确演示用例、预期状态转换和单独运行命令见 [MECHANISM_DEMO.md](MECHANISM_DEMO.md)。真实模型端到端实验保存在 `test_projects/`，不属于离线回归的必要条件。
+六个精确演示用例、预期状态转换和单独运行命令见 [MECHANISM_DEMO.md](docs/MECHANISM_DEMO.md)。真实模型端到端实验保存在 `test_projects/`，不属于离线回归的必要条件。
 
 ## 分发命令
 
-本项目使用 `setuptools` 构建 wheel 与源码包。执行：
+以下命令面向维护者，不是普通用户的启动步骤。项目使用 `setuptools` 构建 wheel 与源码包：
 
 ```powershell
 python -m pip install -e ".[dev]"
@@ -194,13 +188,15 @@ python -m pip install .\dist\harness_agent-0.1.0-py3-none-any.whl
 harness-agent --help
 ```
 
-GitLab CI 的分发流程为：
+GitHub Actions 的分发流程为：
 
 - `unit-test`：运行完整离线测试；
 - `package-build`：构建并校验 wheel/sdist，在隔离虚拟环境安装 wheel 并检查 CLI；
-- `package-publish`：仅在 `v<主版本>.<次版本>.<修订号>` tag 上使用 GitLab 自动提供的 `CI_JOB_TOKEN` 发布到项目 PyPI Package Registry。
+- `release`：仅在 `v<主版本>.<次版本>.<修订号>` tag 上使用 GitHub 自动提供的短期令牌创建 Release，并上传 wheel/sdist。
 
-CI 不需要或保存真实 API Key。未创建发布 tag 时，可从 `package-build` Artifact 获取安装包。
+CI 不需要或保存真实 API Key。未创建发布 tag 时，可从 `package-build` Artifact 获取安装包；创建 tag 后，可从仓库的 Releases 页面长期下载。
+
+当前实现满足“标准 Python 包可由 `pip` 安装”的技术要求。最终交付前仍需推送语义版本 tag，并确认 GitHub Actions 成功创建 Release；本项目通过 Release URL 安装，不声称已发布到公共 Python 包索引。
 
 ## 目录结构
 
@@ -222,13 +218,16 @@ HarnessAgent/
 │   ├── unit/           # 确定性机制单元测试
 │   └── integration/    # Mock LLM 纵向循环测试
 ├── test_projects/      # 真实模型端到端实验项目
-├── docs/requirement/   # 课程通用要求与 Harness 专项要求
-├── SPEC.md             # 设计与验收契约
-├── PLAN.md             # 里程碑、TDD 步骤与实现证据
-├── SPEC_PROCESS.md     # 规约形成与关键取舍
-├── MECHANISM_DEMO.md   # 可重复运行的机制演示
-├── AGENT_LOG.md        # AI 协作过程记录
-├── .gitlab-ci.yml      # 测试、构建和 tag 发布流水线
+├── docs/
+│   ├── AGENT_LOG.md        # AI 协作过程记录
+│   ├── MECHANISM_DEMO.md   # 可重复运行的机制演示
+│   ├── PLAN.md             # 里程碑、TDD 步骤与实现证据
+│   ├── REFLECTION.md       # 项目反思报告
+│   ├── SPEC.md             # 设计与验收契约
+│   └── SPEC_PROCESS.md     # 规约形成与关键取舍
+├── .github/workflows/  # GitHub Actions 测试、构建和 Release 流水线
+├── AGENTS.md           # Codex 项目约束
+├── README.md           # 项目入口文档
 └── pyproject.toml      # 包元数据、依赖与 CLI 入口
 ```
 
@@ -253,13 +252,13 @@ HarnessAgent 在应用层实施以下确定性边界：
 - Linux 真实模式依赖可用的 Secret Service/keyring 后端；无后端的服务器仍可运行 Mock 模式；
 - wheel 与 CPU 架构无关，但目标机必须预装 Python 3.12+；
 - 当前主要交互形态为本地 CLI，仓库未提供 WebUI；
-- GitLab Package Registry 仅在语义版本 tag 的发布流水线成功后出现对应版本。
+- GitHub Release 仅在语义版本 tag 的发布流水线成功后出现对应版本。
 
 ## 相关文档
 
-- [SPEC.md](SPEC.md)：问题、范围、架构、机制设计与验收标准；
-- [PLAN.md](PLAN.md)：实现任务、依赖、TDD 步骤和当前证据；
-- [SPEC_PROCESS.md](SPEC_PROCESS.md)：规约形成、冷启动检查与人工取舍；
-- [MECHANISM_DEMO.md](MECHANISM_DEMO.md)：六项确定性机制演示；
-- [AGENT_LOG.md](AGENT_LOG.md)：按时间整理的 AI 协作记录；
-- [通用要求](docs/requirement/common_requirement.md)与 [Harness 专项要求](docs/requirement/AI4SE_Final_Project_A_Coding_Agent_Harness.md)。
+- [SPEC.md](docs/SPEC.md)：问题、范围、架构、机制设计与验收标准；
+- [PLAN.md](docs/PLAN.md)：实现任务、依赖、TDD 步骤和当前证据；
+- [SPEC_PROCESS.md](docs/SPEC_PROCESS.md)：规约形成、冷启动检查与人工取舍；
+- [MECHANISM_DEMO.md](docs/MECHANISM_DEMO.md)：六项确定性机制演示；
+- [REFLECTION.md](docs/REFLECTION.md)：项目过程、工程取舍与方法论反思；
+- [AGENT_LOG.md](docs/AGENT_LOG.md)：按时间整理的 AI 协作记录。
